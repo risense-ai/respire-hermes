@@ -1,0 +1,10 @@
+name: respire
+version: 0.1.0
+description: "Respire (rsrs) local-first encrypted memory: per-turn title-tier recall via prefetch, judge-then-store remember tool, causal-tree show, cross-agent shared library. Wrapper-style provider — the rsrs CLI engine is a sidecar (npm i -g @rsrsai/cli), zero Python dependency surface."
+hooks:
+  - system_prompt_block
+  - prefetch
+  - queue_prefetch
+  - sync_turn
+  - on_session_end
+  - shutdown
