@@ -651,8 +651,14 @@ class RespireMemoryProvider(MemoryProvider):
 
     # ---- setup UX（官方 setup 面均由 provider 目录内文件驱动） ----
 
-    def get_status_config(self):
-        """喂 hermes memory status：引擎/登录/库量（来自缓存探测）。"""
+    def get_status_config(self, provider_config=None):
+        """喂 hermes memory status：引擎/登录/库量（来自缓存探测）。
+
+        Hermes 的 CLI 以 ``provider.get_status_config(provider_config)`` 调用本方法
+        （见 hermes_cli/memory_setup.py），因此必须接受一个位置参数；
+        只定义 ``self`` 会让 ``hermes memory status`` 报
+        ``takes 1 positional argument but 2 were given``。
+        """
         probe = self._probe or (None, None, None)
         return {
             "engine": self._engine or "",
