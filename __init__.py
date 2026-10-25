@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # respire —— respire(rsrs) × Hermes Agent 记忆 provider（目录插件，根=__init__.py+register()）
 # 与 respire-zcode / respire-kimi / respire-dimcode / respire-qoder / respire-workbuddy 同源方案，
-# 按 Hermes「Memory Provider Plugins」官方契约（2026-10-23 文档核实）移植：
+# 按 Hermes「Memory Provider Plugins」官方契约（Hermes v0.22.5 基线）移植：
 #   prefetch(query)            ← 每轮 UserPromptSubmit 召回（标题档）＋「记：」前缀直落库＋/nomem 跳过
 #   system_prompt_block()      ← SessionStart 简则＋引擎状态引导（未装/未登录/空库/缺模型）
 #   sync_turn(user, assistant) ← 非阻塞后台刷「近窗落库」缓存，供存储催促判定（铁律：spawn_context_thread）
@@ -63,7 +63,7 @@ except Exception:  # pragma: no cover
 RECALL_T = 14
 PROBE_T = 10
 STORE_T = 18
-LIST_T = 6    # 「近窗落库」检查窗口（实测 list ~0.9s，热后即回）
+LIST_T = 30   # 「近窗落库」检查窗口（1.0.16 冷启动实测可达 27s；热态约 0.3–0.9s）
 LOG_MAX = 256 * 1024  # plugin.log 超此整文件清轮
 
 DEFAULTS = {
@@ -93,9 +93,9 @@ RULES = """【respire 记忆层 · 已挂接】respire（rsrs）记忆库随本�
 5. 口令、证件号、手机号、卡号、私钥禁入记忆正文与查询词，只写存放位置——库虽加密，密钥泄露即裸奔。
 6. 同步 rsrs sync（autosync 常开）、rsrs status 查态、rsrs prompt 读完整工作流；深用法见 respire:respire 技能。"""
 
-NO_RSRS = """【respire·引擎未装】provider 已就绪，只差引擎。请立即代为执行安装，无需等用户：
-  npm i -g rsrs-cli@latest
-（无全局写权限时先试：npm config set prefix ~/.npm-global && npm i -g rsrs-cli@latest）
+NO_RSRS = """【respire·引擎未装】provider 已就绪，只差引擎。先向用户说明并征得同意，再执行安装（遵循 Hermes 的审批流程，不得自动批准）：
+  npm i -g rsrs-cli@1.0.16
+（无全局写权限时先试：npm config set prefix ~/.npm-global && npm i -g rsrs-cli@1.0.16）
 装完跑 rsrs --version 确认——本层每轮实时探测，装完重启 Hermes 或下一会话即恢复召回与「记：」落库。
 配置下一步（你顺手引导即可）：rsrs status 查登录态；未登录则请用户去 https://rsrs.rs 注册后本机跑 rsrs register --user <名>（登录密码本人设≥8位；超级密码绝不自造、绝不传 --super——系统自动生成 A3-… 恢复码并在输出中醒目列出，务必抄下保存，丢失则任何设备都解不开记忆）；日常 rsrs login；语义模型可选，想要更好召回再 rsrs model install && rsrs model activate m3。"""
 
@@ -130,6 +130,31 @@ def redact(s: str) -> str:
 
 # ---------------- 引擎侧（与 hook 系家族同源，subprocess rsrs CLI sidecar） ----------------
 
+# 传给 sidecar 的最小环境：宿主进程可能持有各家的 API key / token，绝不整包透传。
+# 只放运行 rsrs 所需的路径/本地化/代理/TLS 变量，外加 RSRS_*/RESPIRE_* 配置；
+# 名字里带敏感词的（RSRS_SUPER、TOKEN、SECRET…）一律剔除。
+_SIDECAR_ENV_ALLOW = frozenset({
+    "HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "TMP", "TEMP",
+    "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM", "SHELL", "PWD",
+    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS", "GNOME_KEYRING_CONTROL",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+    "NO_COLOR", "FORCE_COLOR", "HERMES_HOME",
+})
+_SIDECAR_SECRET_NAME = re.compile(r"(TOKEN|SECRET|PASSWORD|PASSWD|SUPER|API_?KEY|CREDENTIAL|AUTH)", re.I)
+
+
+def sidecar_env() -> dict:
+    """Build the environment for the rsrs sidecar (never the full host environment)."""
+    env = {k: v for k, v in os.environ.items() if k in _SIDECAR_ENV_ALLOW}
+    for k, v in os.environ.items():
+        if k.startswith(("RSRS_", "RESPIRE_")) and not _SIDECAR_SECRET_NAME.search(k):
+            env[k] = v
+    return env
+
+
 def find_rsrs(cfg: dict):
     """引擎探测链：显式配置 → 环境变量 → PATH → 常见安装位。纯文件探测，无 exec、无网络（is_available 契约）。"""
     home = os.path.expanduser("~")
@@ -152,7 +177,7 @@ def find_rsrs(cfg: dict):
 
 def run_rsrs(bin_path: str, args: list, timeout: int):
     # rsrs 的 --json 模式下进度写 stderr，capture 须分离，只解析 stdout
-    env = dict(os.environ)  # 传播 HERMES_HOME 等剖面上下文给 sidecar（wrapper 契约）
+    env = sidecar_env()  # 仅传最小环境（含 HERMES_HOME/RSRS_* 配置），绝不透传宿主密钥
     return subprocess.run([bin_path] + args, capture_output=True, text=True,
                           encoding="utf-8", errors="replace", timeout=timeout, env=env)
 
@@ -520,7 +545,7 @@ class RespireMemoryProvider(MemoryProvider):
             {
                 "key": "rsrs_path",
                 "description": ("rsrs 引擎二进制路径（留空=自动探测 PATH 与常见安装位）。"
-                                "引擎安装：npm i -g rsrs-cli@latest"),
+                                "引擎安装：npm i -g rsrs-cli@1.0.16"),
                 "default": "",
                 "env_var": "RESPIRE_BIN",
             },
@@ -658,10 +683,22 @@ class RespireMemoryProvider(MemoryProvider):
         （见 hermes_cli/memory_setup.py），因此必须接受一个位置参数；
         只定义 ``self`` 会让 ``hermes memory status`` 报
         ``takes 1 positional argument but 2 were given``。
+
+        ``provider_config`` 是 ``config.yaml`` 里 ``memory.respire`` 的原始 dict；
+        CLI 在 ``initialize()`` 之前调用本方法，此时用 ``rsrs_path`` 重新探测引擎，
+        否则状态页会误显示 engine 为空（Status 本身仍由 is_available 判定）。
         """
+        cfg = dict(self._cfg)
+        if isinstance(provider_config, dict):
+            if isinstance(provider_config.get("rsrs_path"), str):
+                cfg["rsrs"] = provider_config["rsrs_path"]
+            for key, ref in DEFAULTS.items():
+                if key in provider_config and _typed(provider_config[key], ref):
+                    cfg[key] = provider_config[key]
+        engine = self._engine or find_rsrs(cfg)
         probe = self._probe or (None, None, None)
         return {
-            "engine": self._engine or "",
+            "engine": engine or "",
             "logged_in": probe[0],
             "entries": probe[1],
             "probe_ok": probe[2],

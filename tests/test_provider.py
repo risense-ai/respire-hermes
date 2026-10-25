@@ -113,10 +113,11 @@ try:
     check("引擎缺失 remember 回错误文本", "引擎未装" in pe.handle_tool_call("respire_remember", {"content": "x"}))
     check("prefetch 引擎缺失静默", pe.prefetch("rsrs 信封结构解析") is None)
     r = pe.prefetch("记：引擎缺失时的落库应回装法")
-    check("prefetch 落库前缀引擎缺失回装法", isinstance(r, str) and "npm i -g rsrs-cli" in r, r)
+    check("prefetch 落库前缀引擎缺失回装法", isinstance(r, str) and "npm i -g rsrs-cli@1.0.16" in r, r)
     sb = pe.system_prompt_block()
-    check("prompt 块引擎缺失注入装法", "npm i -g rsrs-cli@latest" in sb)
+    check("prompt 块引擎缺失注入装法", "npm i -g rsrs-cli@1.0.16" in sb)
     check("装法禁自造超级密码", "绝不传 --super" in sb)
+    check("装法要求先征得同意", "征得同意" in sb and "无需等用户" not in sb)
     check("装法含注册站点", "rsrs.rs" in sb)
 finally:
     mod.find_rsrs = real_find
@@ -182,6 +183,15 @@ check("缺模型点明词面回退", "词面档" in block_with_probe((True, 500,
 check("已装模型不带提示", "BGE-M3）未装" not in block_with_probe((True, 500, True), no_model=True))
 check("get_status_config 平面 dict", isinstance(prov.get_status_config(), dict)
       and {"engine", "logged_in", "entries", "probe_ok"} <= set(prov.get_status_config()))
+_real_find = mod.find_rsrs
+_saved_engine = prov._engine
+mod.find_rsrs = lambda cfg: cfg.get("rsrs") or None
+prov._engine = None
+_status_from_cfg = prov.get_status_config({"rsrs_path": "/opt/rsrs"})
+check("get_status_config 用 provider_config 探测引擎",
+      _status_from_cfg.get("engine") == "/opt/rsrs", _status_from_cfg)
+prov._engine = _saved_engine
+mod.find_rsrs = _real_find
 
 # ---- 5) sync_turn 非阻塞 + 催促判定（引擎桩：list 回陈旧/新鲜时间戳） ----
 t0 = time.time()
@@ -258,6 +268,17 @@ check("extract_title 退分隔符", "，" in mod.extract_title("这是一条没�
 check("extract_title 70 字上限", len(mod.extract_title("默" * 200)) <= 70)
 check("redact 口令脱敏", "hunter2" not in mod.redact("密码: hunter2 test"))
 check("redact token 脱敏", "REDACTED" in mod.redact("sk-abcdef1234567890"))
+os.environ["RSRS_SUPER"] = "do-not-pass"
+os.environ["OPENAI_API_KEY"] = "sk-do-not-pass"
+os.environ["RSRS_DATA_DIR"] = "/tmp/rsrs-sidecar-test"
+os.environ["RSRS_LIBC"] = "musl"
+_sidecar = mod.sidecar_env()
+check("sidecar env 不透传宿主密钥", "RSRS_SUPER" not in _sidecar and "OPENAI_API_KEY" not in _sidecar)
+check("sidecar env 保留基础变量", "HOME" in _sidecar and "PATH" in _sidecar and "HERMES_HOME" in _sidecar)
+check("sidecar env 保留非敏感 rsrs 配置", _sidecar.get("RSRS_DATA_DIR") == "/tmp/rsrs-sidecar-test"
+      and _sidecar.get("RSRS_LIBC") == "musl")
+for _k in ("RSRS_SUPER", "OPENAI_API_KEY", "RSRS_DATA_DIR", "RSRS_LIBC"):
+    os.environ.pop(_k, None)
 check("_epoch 解析 Z 尾", mod._epoch("2026-10-22T15:06:38.926Z") is not None)
 check("_epoch 坏输入 None", mod._epoch("not-a-date") is None)
 check("format_recall 零命中空串", mod.format_recall({"details": []}, 5, 0.0, 1500) == ("", 0))
@@ -299,7 +320,7 @@ if ENGINE:
     check("真库 recall 回文本", isinstance(out, str) and out.startswith("【respire"), out[:80])
     logged, total, ok = mod.probe_status(ENGINE)
     check("真库 status 探测回 ok", ok is True)
-    r = mod.run_rsrs(ENGINE, ["list", "--limit", "1", "--json"], 10)
+    r = mod.run_rsrs(ENGINE, ["list", "--limit", "1", "--json"], mod.LIST_T)
     try:
         first = json.loads(r.stdout)["details"][0]
     except Exception:

@@ -72,7 +72,7 @@ jobs:
             echo '- sha256: '"${{ steps.pkg.outputs.sha }}"
             echo '- 包结构：zip 根=插件根（__init__.py/plugin.yaml 在根）'
             echo '- 安装：解压到 $HERMES_HOME/plugins/respire/（或仓库 scripts/install.sh），然后 hermes memory setup 选 respire'
-            echo '- 引擎（rsrs CLI）缺失时 provider 会在 system prompt 注入装法（npm i -g rsrs-cli@latest）'
+            echo '- 引擎（rsrs CLI）缺失时 provider 会在 system prompt 注入装法（npm i -g rsrs-cli@1.0.16）'
           } > "${NOTES}"
           gh release create "${GITHUB_REF_NAME}" "${{ steps.pkg.outputs.zip }}" \
             --target "${GITHUB_SHA}" \
