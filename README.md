@@ -26,7 +26,7 @@
 
 ```bash
 # 1) 引擎（已装可跳过；装完 rsrs --version 验证）
-npm i -g @rsrsai/cli@latest
+npm i -g rsrs-cli@latest
 rsrs register --user <你的名字>   # 首设备注册，去 https://rsrs.rs；超级密码用系统生成的 A3- 恢复码并抄下
 # 语义召回（可选）：rsrs model install && rsrs model activate m3
 

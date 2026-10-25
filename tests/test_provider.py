@@ -113,9 +113,9 @@ try:
     check("引擎缺失 remember 回错误文本", "引擎未装" in pe.handle_tool_call("respire_remember", {"content": "x"}))
     check("prefetch 引擎缺失静默", pe.prefetch("rsrs 信封结构解析") is None)
     r = pe.prefetch("记：引擎缺失时的落库应回装法")
-    check("prefetch 落库前缀引擎缺失回装法", isinstance(r, str) and "npm i -g @rsrsai/cli" in r, r)
+    check("prefetch 落库前缀引擎缺失回装法", isinstance(r, str) and "npm i -g rsrs-cli" in r, r)
     sb = pe.system_prompt_block()
-    check("prompt 块引擎缺失注入装法", "npm i -g @rsrsai/cli@latest" in sb)
+    check("prompt 块引擎缺失注入装法", "npm i -g rsrs-cli@latest" in sb)
     check("装法禁自造超级密码", "绝不传 --super" in sb)
     check("装法含注册站点", "rsrs.rs" in sb)
 finally:
@@ -312,7 +312,7 @@ if ENGINE:
     pf = prov_r.prefetch("respire 信封结构")
     check("真库 prefetch 不抛", pf is None or isinstance(pf, str))
 else:
-    print("SKIP  引擎段（未找到 rsrs；本机装 @rsrsai/cli 后可全量自测）")
+    print("SKIP  引擎段（未找到 rsrs；本机装 rsrs-cli 后可全量自测）")
 
 # ---- 10) 写探针（--store；写真库→断言→forget 自清理） ----
 if WITH_STORE and ENGINE:

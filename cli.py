@@ -26,7 +26,7 @@ def cmd_status(args):
         prov, _ = _provider()
         prov.initialize("cli-status", hermes_home=_hermes_home())
         st = prov.get_status_config()
-        print(f"engine: {st['engine'] or '(not found — npm i -g @rsrsai/cli@latest)'}")
+        print(f"engine: {st['engine'] or '(not found — npm i -g rsrs-cli@latest)'}")
         print(f"logged_in: {st['logged_in']}")
         print(f"entries: {st['entries']}")
         print(f"probe_ok: {st['probe_ok']}")
@@ -56,7 +56,7 @@ def cmd_recall(args):
 
 
 def cmd_install_engine(args):
-    print("Engine install: npm i -g @rsrsai/cli@latest")
+    print("Engine install: npm i -g rsrs-cli@latest")
     print("Then: rsrs --version   (register at https://rsrs.rs, then `rsrs register --user <name>` on this machine)")
     print("Optional semantic model: rsrs model install && rsrs model activate m3")
 
