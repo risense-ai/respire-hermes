@@ -268,6 +268,8 @@ check("extract_title 退分隔符", "，" in mod.extract_title("这是一条没�
 check("extract_title 70 字上限", len(mod.extract_title("默" * 200)) <= 70)
 check("redact 口令脱敏", "hunter2" not in mod.redact("密码: hunter2 test"))
 check("redact token 脱敏", "REDACTED" in mod.redact("sk-abcdef1234567890"))
+_sidecar_keys = ("RSRS_SUPER", "OPENAI_API_KEY", "RSRS_DATA_DIR", "RSRS_LIBC")
+_sidecar_saved = {k: os.environ.get(k) for k in _sidecar_keys}
 os.environ["RSRS_SUPER"] = "do-not-pass"
 os.environ["OPENAI_API_KEY"] = "sk-do-not-pass"
 os.environ["RSRS_DATA_DIR"] = "/tmp/rsrs-sidecar-test"
@@ -277,8 +279,11 @@ check("sidecar env 不透传宿主密钥", "RSRS_SUPER" not in _sidecar and "OPE
 check("sidecar env 保留基础变量", "HOME" in _sidecar and "PATH" in _sidecar and "HERMES_HOME" in _sidecar)
 check("sidecar env 保留非敏感 rsrs 配置", _sidecar.get("RSRS_DATA_DIR") == "/tmp/rsrs-sidecar-test"
       and _sidecar.get("RSRS_LIBC") == "musl")
-for _k in ("RSRS_SUPER", "OPENAI_API_KEY", "RSRS_DATA_DIR", "RSRS_LIBC"):
-    os.environ.pop(_k, None)
+for _k, _v in _sidecar_saved.items():
+    if _v is None:
+        os.environ.pop(_k, None)
+    else:
+        os.environ[_k] = _v
 check("_epoch 解析 Z 尾", mod._epoch("2026-10-22T15:06:38.926Z") is not None)
 check("_epoch 坏输入 None", mod._epoch("not-a-date") is None)
 check("format_recall 零命中空串", mod.format_recall({"details": []}, 5, 0.0, 1500) == ("", 0))
