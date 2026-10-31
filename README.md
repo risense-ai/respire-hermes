@@ -129,3 +129,17 @@ python3 scripts/validate_plugin.py    # 结构/清单/可编译/fail-open/敏感
 python3 tests/test_provider.py        # 真 rsrs 引擎回环（写探针自清理）；无引擎环境自动跳过引擎段
 bash scripts/package.sh               # dist/respire-<ver>-<date>.zip + sha256（zip 根=插件根）
 ```
+
+## GitHub Actions CI/CD
+
+PR/main 三平台运行原包自检、`python tests/test_ci.py` 的全桩 provider/凭据/隔离/版本测试，以及 `python -m unittest discover -s tests -p test_release.py -v` 的离线发布策略检查。后者即使版本门禁失败也继续提供诊断，但整个 check job 保持失败，打包及发布不会放行。旧 `test_provider.py` 的真实引擎/写探针段不进入 CI。
+
+此前审计发现的 0.1.1/0.1.0 版本遗漏已由贡献者在 e982040 修复，本维护基于该修复，不代改产品版本。实际版本一致性必须通过；任何新错配均使 CI 失败，不改成 skip/xfail。错配负对照仅在临时副本先验证一致基线，再分别改坏，不掩盖实际源码。
+
+沿用不带 v 的标签及 __init__.py/plugin.yaml 位于 ZIP 根的布局，名称仍为 respire-hermes-版本-YYYYMMDD.zip；日期取源提交 UTC 日期以保证恢复稳定。只 git archive 精确源提交，不运行标签代码，校验 manifest/provider VERSION、原始 ZIP 文件名、SHA 与校验和。
+
+旧标签恢复必须从 main 显式输入既有 tag 和完整 expected_sha，校验 main 祖先关系，不移动标签、不用当前 main 冒充旧代码。同来源同内容资产保持不动、补缺失，冲突直接拒绝，绝不 clobber；同版本 tag/dispatch 共用并发锁。Release 附 ZIP 和 SHA256SUMS。
+
+默认 contents:read、checkout不持久化凭据、Actions 固定SHA；仅独立受控发布 job 获得 GITHUB_TOKEN 的 contents:write。无新PAT/OAuth/secret，不使用pull_request_target，fork PR不发布。保留旧清理策略/脚本、plugin-zip 名与只读 cleanup-receipt，等待消费者结束。
+
+桩测试不证明真实 Hermes 宿主、contextvars 并发和安装后Windows回退/真实引擎全链路验收。
