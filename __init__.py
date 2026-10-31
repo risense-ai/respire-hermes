@@ -84,32 +84,49 @@ DEFAULTS = {
 STORE_PREFIX = re.compile(r"^(?:记|存|记录|记住|remember|store)\s*[:：]\s*", re.I)
 # 本轮跳过召回
 SKIP_PREFIX = re.compile(r"^(?:/nomem|#nomem)\b")
+# 疑似凭据扫描：命中则该条 query 不发引擎（不召回也不落库）——与 codex/pi/dsh 侧同一正则口径
+SECRET_RE = re.compile(
+    r"-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----"
+    r"|\b(?:sk-|gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]{12,}"
+    r"|\bBearer\s+[A-Za-z0-9._~+/-]{12,}"
+    r"|(?:password|passwd|api[_ -]?key|token|secret|密码|口令|私钥)\s*[:=：]\s*\S+",
+    re.I)
 
-RULES = """【respire 记忆层 · 已挂接】respire（rsrs）记忆库随本会话生效；数据本地加密、云端同步（账号注册与登录不归本层管，见 rsrs.rs）。
-1. 答前先翻忆：工具 respire_recall（或 shell 跑 rsrs recall "项目名+关键词" --json --titles）；报错、异常先按报错原文翻忆。
-2. 收尾可存：respire_remember（判后即存：相似会给候选，先决断再发；title 是召回与判重的门面，须「主语＋动作＋结果」完整事实句）；消息以「记：」开头时由本层先落库保底——回执带暂拟标题与短 id 时，你须抽取更准的事实句 respire_remember 换标题（retitle）替换。
-3. 每轮自动召回已随 system prompt 注入；未见召回注入、命中不贴题、或话题涉及此前的项目、报错、约定、日期时，换词补查再答（同义词、上位词、英文对应词各试一路）；仅当已有注入确实相关方才勿重复。本轮 /nomem 前缀可关闭自动召回。
-4. 读全文用 respire_show（短 id 前 8 位即可）；因果链深挖 rsrs chain。
-5. 口令、证件号、手机号、卡号、私钥禁入记忆正文与查询词，只写存放位置——库虽加密，密钥泄露即裸奔。
-6. 同步 rsrs sync（autosync 常开）、rsrs status 查态、rsrs prompt 读完整工作流；深用法见 respire:respire 技能。"""
 
-NO_RSRS = """【respire·引擎未装】provider 已就绪，只差引擎。先向用户说明并征得同意，再执行安装（遵循 Hermes 的审批流程，不得自动批准）：
-  npm i -g rsrs-cli@1.0.16
-（无全局写权限时先试：npm config set prefix ~/.npm-global && npm i -g rsrs-cli@1.0.16）
-装完跑 rsrs --version 确认——本层每轮实时探测，装完重启 Hermes 或下一会话即恢复召回与「记：」落库。
-配置下一步（你顺手引导即可）：rsrs status 查登录态；未登录则请用户去 https://rsrs.rs 注册后本机跑 rsrs register --user <名>（登录密码本人设≥8位；超级密码绝不自造、绝不传 --super——系统自动生成 A3-… 恢复码并在输出中醒目列出，务必抄下保存，丢失则任何设备都解不开记忆）；日常 rsrs login；语义模型可选，想要更好召回再 rsrs model install && rsrs model activate m3。"""
+def contains_secret(text: str) -> bool:
+    return bool(SECRET_RE.search(text))
 
-LOGIN_NUDGE = """注意：本机 respire 尚未登录——记忆只存本机、不同步、不跨设备。引导用户：去 rsrs.rs 注册后跑 rsrs register（登录密码本人设；超级密码由系统自动生成 A3-… 恢复码，不要自造，务必保存）；日常登录可由你代跑 rsrs login --oauth --no-open，把授权链接交给用户点击。"""
 
-EMPTY_NUDGE = """注意：本机 respire 记忆库还是空的——没有记忆可召回，自动召回无动静是正常而非故障。引导：用「记：〈事实〉」由本层落库，或先让 agent 把既有项目的约定、报错教训、关键结论存上几条；有货之后每轮召回才有内容。"""
+SECRET_SKIP = ("【respire · skipped】The input looks like it contains a credential — it was not sent "
+               "to the memory engine. Provide only the fact with the secret removed, or a safe location pointer.")
 
-NO_MODEL = """注意：respire 语义模型（BGE-M3）未装——现为词面档。完全可用：注册、登录、同步与召回都不依赖模型；想要更好效果再装：rsrs model install 下载模型，再 rsrs model activate m3 建索引激活召回升为语义档（可代跑，建索引可后台挂起）。"""
+RULES = """【respire memory layer · attached】This session is backed by the local respire (rsrs) memory store; data is encrypted locally and synced to the cloud (account registration and login are outside this layer, see rsrs.rs).
+1. Recall before answering: the respire_recall tool (or shell rsrs recall "project name + keywords" --json --titles); on errors or anomalies, recall using the original error text first.
+2. Store when wrapping up: respire_remember (judge first, store immediately: similar items return candidates, decide before sending; title is the facade for recall and dedup — a complete "subject + action + result" fact sentence); when the message starts with "记：" this layer stores it first as a fallback — if the receipt includes a provisional title and short id, **extract a more precise fact sentence and replace the title with respire_remember (retitle)**.
+3. Automatic recall is injected with the system prompt each turn; if no injection is present, the hits are off-topic, or the topic involves an earlier project, error, agreement, or date, recall again with different wording before answering (try synonyms, hypernyms, and English equivalents, one route each); do not repeat only when the injected hits are truly relevant. Prefix /nomem to disable automatic recall for this turn.
+4. Read full bodies with respire_show (first 8 chars of the id); dig the causal chain with rsrs chain.
+5. Never put passwords, ID numbers, phone numbers, card numbers, or private keys into memory bodies or query terms — record only where they are stored. The library is encrypted, but a leaked key exposes everything.
+6. Sync with rsrs sync (autosync is on), check state with rsrs status, read the full workflow with rsrs prompt; see the respire:respire skill for advanced usage."""
 
-PROBE_FAIL = """注意：respire 状态探测失败（rsrs status 未回）——若是全新机器尚未注册，先引导用户去 rsrs.rs 注册并跑 rsrs register（首设备）；否则可能 runtime 冷启动中，首轮召回空转稍候即通，持续无回跑 rsrs doctor 诊断并转告用户。"""
+NO_RSRS = """【respire · engine missing】The provider is ready; only the engine is missing. Explain to the user and get their consent first, then install (follow Hermes' approval flow; never auto-approve):
+  npm i -g rsrs-cli@latest
+(If global writes are denied, first try: npm config set prefix ~/.npm-global && npm i -g rsrs-cli@latest)
+Then run rsrs --version to confirm — this layer probes every turn; recall and "记：" storage resume after restarting Hermes or in the next session.
+Next steps to guide (mention them in passing): rsrs status checks login state; if signed out, run rsrs register with the user on this machine — no website step (the user sets a login password of at least 8 characters; never invent a super password and never pass --super — the system generates an A3-… recovery code and prints it prominently; copy and keep it, or the memory cannot be unlocked on any device); later authorizations use rsrs login; the semantic model is optional — for better recall run rsrs model install && rsrs model activate m3."""
 
-STORE_NUDGE = ("记忆检查（自动一次）：只做一件事——若你本轮产生了新的事实、决定、约定、教训或踩坑，"
-               "用 respire_remember 分条存入（--importance important；标题按「主语＋动作＋结果」事实句；"
-               "判重给候选先决断：parent 挂靠或 force 直写）；若本轮只是问答闲聊而无新事实，直接结束、勿重复作答。")
+LOGIN_NUDGE = """Note: respire is not signed in on this machine — memory stays local, does not sync, and does not cross devices. Guide the user: run rsrs register on this machine to create the account (the user sets the login password; the super password is a system-generated A3-… recovery code — never invent one, and keep it safe). If an account already exists, you may run rsrs login --oauth --no-open and give the authorization link to the user."""
+
+EMPTY_NUDGE = """Note: the local respire memory store is empty — there is nothing to recall; silent automatic recall is expected, not a failure. Guide the user: store a fact with "记：<fact>", or have the agent first rsrs remember existing project agreements, error lessons, and key conclusions; recall has content only after the store is populated."""
+
+NO_MODEL = """Note: the respire semantic model (BGE-M3) is not installed — the lexical tier is active. Fully usable: registration, login, sync, and recall do not depend on the model. For better results install it: rsrs model install downloads about 1.1GB, then rsrs model activate m3 builds the index and switches recall to the semantic tier (you may run these; indexing can run in the background)."""
+
+PROBE_FAIL = """Note: respire status probe failed (rsrs status did not respond) — if this is a new machine that has never registered, guide the user to run rsrs register on this machine; otherwise the runtime may still be cold-starting, so an empty first recall may resolve after a moment. If it persists, run rsrs doctor, diagnose, and report to the user."""
+
+STORE_NUDGE = ("Memory check (automatic, once): do only one thing — if this turn produced new facts, decisions, "
+               "agreements, lessons, or pitfalls, store them one by one with respire_remember (--importance important; "
+               "titles as \"subject + action + result\" fact sentences; on dedup candidates, decide to attach with parent "
+               "or force the write first); if this turn was just Q&A or chat with no new facts, end directly and do not "
+               "repeat the answer.")
 
 _REDACT = [
     (re.compile(r"(?i)(password|passwd|pwd|密码|口令)\s*[:=：]\s*\S+"), r"\1=[REDACTED]"),
@@ -149,6 +166,13 @@ _SIDECAR_SECRET_NAME = re.compile(r"(TOKEN|SECRET|PASSWORD|PASSWD|SUPER|API_?KEY
 def sidecar_env() -> dict:
     """Build the environment for the rsrs sidecar (never the full host environment)."""
     env = {k: v for k, v in os.environ.items() if k in _SIDECAR_ENV_ALLOW}
+    if os.name == "nt":
+        # Windows 子进程初始化必需键（缺 SystemRoot 时 crypto/runtime 会初始化失败）
+        for k in ("SystemRoot", "SystemDrive", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+                  "PROGRAMDATA", "COMPUTERNAME", "HOMEDRIVE", "HOMEPATH", "WINDIR"):
+            v = os.environ.get(k)
+            if v:
+                env[k] = v
     for k, v in os.environ.items():
         if k.startswith(("RSRS_", "RESPIRE_")) and not _SIDECAR_SECRET_NAME.search(k):
             env[k] = v
@@ -218,19 +242,19 @@ def format_recall(doc: dict, limit: int, threshold: float, budget: int):
         return "", 0
     lines, used = [], 90  # 90 留给头行上界，砍点据此提前
     for score, d in keep:
-        title = str(d.get("title") or "").strip() or "(无题)"
+        title = str(d.get("title") or "").strip() or "(untitled)"
         eid = str(d.get("id") or "")[:8]
-        stale = " →已被取代" if d.get("superseded_by") else ""
-        line = f"- [{score:.2f}] {title}（{eid}）{stale}"
+        stale = " →superseded" if d.get("superseded_by") else ""
+        line = f"- [{score:.2f}] {title} ({eid}){stale}"
         if lines and used + len(line) + 1 > budget:
             break
         lines.append(line)
         used += len(line) + 1
     if not lines:
         return "", 0
-    gate = f"阈值 {threshold:g}，" if threshold > 0 else "rsrs 直出，"
-    head = (f"【respire·自动召回】命中 {len(lines)} 条（{gate}标题档，"
-            "正文 respire_show <短id> 按需读；分数是相关度不是可信度）：")
+    gate = f"threshold {threshold:g}, " if threshold > 0 else "rsrs direct, "
+    head = (f"【respire · auto-recall】matched {len(lines)} item(s) ({gate}title tier; "
+            "read bodies on demand with respire_show <short-id>; scores are relevance, not confidence):")
     return "\n".join([head] + lines), len(lines)
 
 
@@ -259,8 +283,8 @@ def do_store(bin_path: str, content: str, title: str = "", importance: str = "im
              parent: str = "", force: bool = False):
     """判后即存三态——ok 直写 / pending 给候选待决 / 其余为失败；返回回执文本，绝不抛异常。"""
     if not content:
-        return "【respire·落库】内容为空，未入库。"
-    title = (title or "").strip() or extract_title(content) or "respire 快存"
+        return "【respire · store】Content is empty; nothing was stored."
+    title = (title or "").strip() or extract_title(content) or "respire quick store"
     args = ["remember", content, "--title", title, "--importance",
             "trivial" if importance == "trivial" else "important", "--json"]
     if parent:
@@ -270,7 +294,7 @@ def do_store(bin_path: str, content: str, title: str = "", importance: str = "im
     try:
         r = run_rsrs(bin_path, args, STORE_T)
     except Exception as e:
-        return f"【respire·落库】respire 超时未回（{type(e).__name__}），请改手动 rsrs remember 核实是否入库。"
+        return f"【respire · store】respire timed out ({type(e).__name__}); run rsrs remember manually to verify whether it was written."
     try:
         doc = json.loads(r.stdout) if r.stdout else {}
     except Exception:
@@ -280,21 +304,21 @@ def do_store(bin_path: str, content: str, title: str = "", importance: str = "im
     status = str(doc.get("status") or "")
     if status == "ok":
         sid = str((doc.get("summary") or {}).get("id") or "")
-        tail = f"（{sid[:8]}）" if sid else ""
-        return (f"【respire·落库】已存入：{title}{tail}。若标题系规则暂拟——"
-                "请从内容抽取「主语＋动作＋结果」的完整事实句，"
-                f"rsrs retitle {sid[:8]} --title 替换（title 是召回与判重的门面）。")
+        tail = f" ({sid[:8]})" if sid else ""
+        return (f"【respire · stored】Saved: {title}{tail}. The title is a rule-based provisional one — "
+                "extract a complete \"subject + action + result\" fact sentence from the content and "
+                f"replace it with rsrs retitle {sid[:8]} --title (title is the facade for recall and dedup).")
     if status == "pending":
         # 判后即存判定疑似重复/可挂靠，未写入（written:false）——转述候选，模型接续决断
-        lines = ["【respire·落库待决】respire 判定本条与既有记忆相似，未写入。候选："]
+        lines = ["【respire · store pending】respire judged this item similar to existing memory; nothing was written. Candidates:"]
         for it in (doc.get("items") or [])[:5]:
             if isinstance(it, dict):
                 lines.append(f"- [{it.get('name', '?')}] {it.get('value', '')}")
-        lines.append("请决断：挂靠则 respire_remember 同文 parent=<id> 重发；确属独立则 force=true 直写。")
+        lines.append("Decide: to attach, resend via respire_remember with the same text and parent=<id>; if it is genuinely independent, force=true writes it directly.")
         return "\n".join(lines)
     errs = doc.get("errors") or []
     msg = json.dumps(errs, ensure_ascii=False)[:200] if errs else f"status={status or r.returncode}"
-    return f"【respire·落库失败】respire 未收：{msg}"
+    return f"【respire · store failed】respire did not accept it: {msg}"
 
 
 def do_show(bin_path: str, entry_id: str):
@@ -302,27 +326,27 @@ def do_show(bin_path: str, entry_id: str):
     try:
         r = run_rsrs(bin_path, ["show", entry_id, "--json"], LIST_T)
     except Exception as e:
-        return f"【respire·读取失败】rsrs show 超时/异常（{type(e).__name__}）。"
+        return f"【respire · read failed】rsrs show timed out or errored ({type(e).__name__})."
     try:
         doc = json.loads(r.stdout) if r.stdout else {}
     except Exception:
-        return f"【respire·读取失败】输出不可解析（rc={r.returncode}）。"
+        return f"【respire · read failed】Output could not be parsed (rc={r.returncode})."
     if not isinstance(doc, dict) or doc.get("status") != "ok":
         errs = doc.get("errors") if isinstance(doc, dict) else None
-        return f"【respire·读取失败】{json.dumps(errs, ensure_ascii=False)[:200] if errs else 'status!=ok'}"
+        return f"【respire · read failed】{json.dumps(errs, ensure_ascii=False)[:200] if errs else 'status!=ok'}"
     det = doc.get("details") or {}
     entry = det.get("entry") or {} if isinstance(det, dict) else {}
     if not entry:
-        return "【respire·读取失败】信封无 entry。"
-    out = [f"【respire·条目】{entry.get('title', '(无题)')}（{str(entry.get('id', ''))[:8]}）",
-           f"重要度：{entry.get('importance', '?')}；改于：{entry.get('updated_at', '?')}",
+        return "【respire · read failed】Envelope has no entry."
+    out = [f"【respire · entry】{entry.get('title', '(untitled)')} ({str(entry.get('id', ''))[:8]})",
+           f"Importance: {entry.get('importance', '?')}; updated: {entry.get('updated_at', '?')}",
            "", str(entry.get("content", ""))]
     anc = det.get("ancestors") or []
     if anc:
-        out += ["", "【因果·上游】" + " ← ".join(str(a.get("title", "?")) for a in anc[-3:][::-1])]
+        out += ["", "【causal · upstream】" + " ← ".join(str(a.get("title", "?")) for a in anc[-3:][::-1])]
     ch = det.get("children") or []
     if ch:
-        out += ["【因果·下游】" + "；".join(str(c.get("title") or c.get("summary", "?")) for c in ch[:5])]
+        out += ["【causal · downstream】" + "；".join(str(c.get("title") or c.get("summary", "?")) for c in ch[:5])]
     return "\n".join(out)
 
 
@@ -614,6 +638,9 @@ class RespireMemoryProvider(MemoryProvider):
             for pat in (self._cfg.get("skip_prefixes") or []):   # 宿主内部提示白名单
                 if isinstance(pat, str) and pat and q[:len(pat)].lower() == pat.lower():
                     return None
+            if contains_secret(q):
+                self._log("prefetch", "secret_skip", q[:40])
+                return SECRET_SKIP
             engine = self._engine or find_rsrs(self._cfg)
             m = STORE_PREFIX.match(q)
             if m:
