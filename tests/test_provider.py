@@ -113,12 +113,12 @@ try:
     check("引擎缺失 remember 回错误文本", "引擎未装" in pe.handle_tool_call("respire_remember", {"content": "x"}))
     check("prefetch 引擎缺失静默", pe.prefetch("rsrs 信封结构解析") is None)
     r = pe.prefetch("记：引擎缺失时的落库应回装法")
-    check("prefetch 落库前缀引擎缺失回装法", isinstance(r, str) and "npm i -g rsrs-cli@1.0.16" in r, r)
+    check("prefetch 落库前缀引擎缺失回装法", isinstance(r, str) and "npm i -g rsrs-cli@latest" in r, r)
     sb = pe.system_prompt_block()
-    check("prompt 块引擎缺失注入装法", "npm i -g rsrs-cli@1.0.16" in sb)
-    check("装法禁自造超级密码", "绝不传 --super" in sb)
-    check("装法要求先征得同意", "征得同意" in sb and "无需等用户" not in sb)
-    check("装法含注册站点", "rsrs.rs" in sb)
+    check("prompt 块引擎缺失注入装法", "npm i -g rsrs-cli@latest" in sb)
+    check("装法禁自造超级密码", "never pass --super" in sb)
+    check("装法要求先征得同意", "get their consent first" in sb and "never auto-approve" in sb)
+    check("装法含本机注册", "rsrs register with the user" in sb)
 finally:
     mod.find_rsrs = real_find
 
@@ -132,6 +132,8 @@ check("prefetch 空 query None", prov.prefetch("") is None)
 check("prefetch 非 str 容错 None", prov.prefetch(123) is None)
 check("prefetch /nomem 跳过", prov.prefetch("/nomem rsrs 信封") is None)
 check("prefetch #nomem 跳过", prov.prefetch("#nomem rsrs 信封") is None)
+check("prefetch 疑似凭据拦截", prov.prefetch("api_key = " + "sk-" + "kvbbfuzkmrhtrxhbvqda" + " 存一下") == mod.SECRET_SKIP)
+check("prefetch 疑似凭据不落库", "记：数据库密码 = hunter2u".startswith("记") and mod.contains_secret("记：数据库密码 = hunter2u"))
 check("prefetch 单字过短 None", prov.prefetch("嗯") is None)
 
 prov_skip = new_prov(cfg={"skip_prefixes": ["你正在为宿主写 Recap"]})
@@ -166,20 +168,20 @@ def block_with_probe(probe_tuple, no_model=None):
 
 
 b = new_prov()
-check("prompt 块含简则", "respire 记忆层" in b.system_prompt_block())
-check("简则点明同步站点", "rsrs.rs" in b.system_prompt_block())
+check("prompt 块含简则", "respire memory layer" in b.system_prompt_block())
+check("简则点明同步与引擎", "rsrs sync" in b.system_prompt_block())
 p_none = new_prov()
 p_none._probe = None
-check("探测未回只出简则（不误报）", "尚未登录" not in p_none.system_prompt_block())
-check("未登录注入引导", "尚未登录" in block_with_probe((False, None, True)))
+check("探测未回只出简则（不误报）", "not signed in" not in p_none.system_prompt_block())
+check("未登录注入引导", "not signed in" in block_with_probe((False, None, True)))
 check("登录引导给代登法", "rsrs login --oauth --no-open" in block_with_probe((False, None, True)))
-check("空库注入首日引导", "记忆库还是空的" in block_with_probe((True, 3, True)))
-check("有货库不带空库引导", "记忆库还是空的" not in block_with_probe((True, 500, True)))
-check("已登录不带登录引导", "尚未登录" not in block_with_probe((True, 500, True)))
-check("探测失败注入诊断段", "状态探测失败" in block_with_probe((None, None, False)))
-check("探测失败含未注册分支", "尚未注册" in block_with_probe((None, None, False)))
+check("空库注入首日引导", "memory store is empty" in block_with_probe((True, 3, True)))
+check("有货库不带空库引导", "memory store is empty" not in block_with_probe((True, 500, True)))
+check("已登录不带登录引导", "not signed in" not in block_with_probe((True, 500, True)))
+check("探测失败注入诊断段", "status probe failed" in block_with_probe((None, None, False)))
+check("探测失败含未注册分支", "never registered" in block_with_probe((None, None, False)))
 check("缺模型注入装法", "rsrs model activate m3" in block_with_probe((True, 500, True), no_model=False))
-check("缺模型点明词面回退", "词面档" in block_with_probe((True, 500, True), no_model=False))
+check("缺模型点明词面回退", "lexical tier" in block_with_probe((True, 500, True), no_model=False))
 check("已装模型不带提示", "BGE-M3）未装" not in block_with_probe((True, 500, True), no_model=True))
 check("get_status_config 平面 dict", isinstance(prov.get_status_config(), dict)
       and {"engine", "logged_in", "entries", "probe_ok"} <= set(prov.get_status_config()))
@@ -205,24 +207,28 @@ check("sync_turn 计轮", prov._turns >= 1)
 def stub_engine(recall_hit=True, stale=True):
     path = os.path.join(TMP, f"rsrs-stub-{recall_hit}-{stale}-{time.time_ns()}")
     ts = "2020-01-01T00:00:00.000Z" if stale else time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
-    det = json.dumps([{"score": 0.55, "id": "aaaabbbbccccdddd", "title": "桩命中条目", "superseded_by": None}])
+    det = repr([{"score": 0.55, "id": "aaaabbbbccccdddd", "title": "桩命中条目", "superseded_by": None}])
     with open(path, "w", encoding="utf-8") as f:
-        f.write(f"""#!/usr/bin/env bash
-if [ "$1" = "recall" ]; then
-  if [ "{1 if recall_hit else 0}" = "1" ]; then
-    printf '{{"command":"recall","status":"ok","details":{det}}}'
-  else
-    printf '{{"command":"recall","status":"skip","details":[]}}'
-  fi
-  exit 0
-fi
-if [ "$1" = "list" ]; then
-  printf '{{"command":"list","status":"ok","details":[{{"id":"aaaabbbbccccdddd","created_at":"{ts}","updated_at":"{ts}","title":"t","content":"c"}}]}}'
-  exit 0
-fi
-exit 1
+        f.write(f"""#!/usr/bin/env python3
+import json, os, sys
+sub = sys.argv[1] if len(sys.argv) > 1 else ""
+if sub == "recall":
+    if "{1 if recall_hit else 0}" == "1":
+        print(json.dumps({{"command":"recall","status":"ok","details":{det}}}))
+    else:
+        print(json.dumps({{"command":"recall","status":"skip","details":[]}}))
+elif sub == "list":
+    print(json.dumps({{"command":"list","status":"ok","details":[{{"id":"aaaabbbbccccdddd","created_at":"{ts}","updated_at":"{ts}","title":"t","content":"c"}}]}}))
+else:
+    sys.exit(1)
 """)
     os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
+    if os.name == "nt":
+        # Windows：python 脚本不能被 CreateProcess 直接 exec，包一层 .cmd（同 workbuddy 测试）
+        py = sys.executable
+        with open(path + ".cmd", "w", encoding="utf-8", newline="") as f:
+            f.write("@echo off" + chr(13) + chr(10) + '"%s" "%%~dp0%s" %%*' % (py, os.path.basename(path)) + chr(13) + chr(10))
+        return path + ".cmd"
     return path
 
 
@@ -230,23 +236,23 @@ stub = stub_engine()
 prov_stub = new_prov(cfg={"rsrs": stub})
 prov_stub._engine = stub
 out = prov_stub.prefetch("桩查询触发召回")
-check("prefetch 桩召回注入标题档", isinstance(out, str) and "桩命中条目" in out and "【respire·自动召回】" in out, out)
-check("标题档头行 rsrs 直出", "rsrs 直出" in out, out)
+check("prefetch 桩召回注入标题档", isinstance(out, str) and "桩命中条目" in out and "【respire · auto-recall】" in out, out)
+check("标题档头行 rsrs 直出", "rsrs direct" in out, out)
 prov_stub._turns = 1
 prov_stub._last_store_ts = time.time() - 3600  # 引擎侧一小时无落库
 out2 = prov_stub.prefetch("桩查询触发召回")
-check("近窗无落库附催促", isinstance(out2, str) and "记忆检查" in out2 and "respire_remember" in out2, out2)
+check("近窗无落库附催促", isinstance(out2, str) and "Memory check" in out2 and "respire_remember" in out2, out2)
 prov_stub._last_store_ts = time.time() - 30     # 刚落库
 out3 = prov_stub.prefetch("桩查询触发召回")
-check("近窗已落库不催", isinstance(out3, str) and "记忆检查" not in out3, out3)
+check("近窗已落库不催", isinstance(out3, str) and "Memory check" not in out3, out3)
 prov_stub._last_store_ts = time.time() - 3600
 prov_stub._cfg["store_nudge_every"] = 0
 out4 = prov_stub.prefetch("桩查询触发召回")
-check("store_nudge_every=0 关催促", isinstance(out4, str) and "记忆检查" not in out4, out4)
+check("store_nudge_every=0 关催促", isinstance(out4, str) and "Memory check" not in out4, out4)
 prov_stub._cfg["store_nudge_every"] = 1
 prov_stub._cfg["budget_chars"] = 120
 out5 = prov_stub.prefetch("桩查询触发召回")
-check("budget_chars 截断生效", isinstance(out5, str) and len(out5) < 400, len(out5 or ""))
+check("budget_chars 截断生效", isinstance(out5, str) and len(out5) < 700, len(out5 or ""))
 prov_stub._turns = 0
 out6 = prov_stub.prefetch("桩查询触发召回")
 check("首轮（turns=0）不催", isinstance(out6, str) and "记忆检查" not in out6, out6)
@@ -261,6 +267,59 @@ check("新鲜落库不催（问库路径）", isinstance(out7, str) and "记忆�
 stub_miss = new_prov(cfg={"rsrs": stub_engine(recall_hit=False)})
 out8 = stub_miss.prefetch("无关桩查询")
 check("零命中静默注入", out8 is None, out8)
+
+# ---- 5b) secret-skip 回归：凭据 query 不进引擎、不落日志、不回显 ----
+# 合成凭据运行时拼接（避免测试文件出现 secret-like 字面量）；取无前缀值+Bearer 形态，
+# 因为 redact 只兜 sk-/ghp 等前缀与口令赋值，Bearer 值靠「只记固定事件码」兜底。
+CRED = "synthetic" + "qv7xk2mwje"          # 18 位无前缀合成凭据（redact 不覆盖 → 老代码必泄漏，回归可检）
+CRED_QUERY = "Bearer " + CRED + " 这条含凭据不要入库"
+rec_path = os.path.join(TMP, f"rsrs-recording-{time.time_ns()}")
+rec_calls = rec_path + ".calls"
+with open(rec_path, "w", encoding="utf-8") as f:
+    f.write(f"""#!/usr/bin/env python3
+import json, os, sys
+with open({rec_calls!r}, "a", encoding="utf-8") as c:
+    c.write(" ".join(sys.argv[1:]) + chr(10))
+sub = sys.argv[1] if len(sys.argv) > 1 else ""
+if sub == "recall":
+    print(json.dumps({{"command": "recall", "status": "ok", "details": []}}))
+elif sub == "list":
+    print(json.dumps({{"command": "list", "status": "ok", "details": []}}))
+else:
+    sys.exit(1)
+""")
+os.chmod(rec_path, os.stat(rec_path).st_mode | stat.S_IEXEC)
+if os.name == "nt":
+    # Windows：python 脚本不能被 CreateProcess 直接 exec，包一层 .cmd（同上 stub_engine）
+    py = sys.executable
+    with open(rec_path + ".cmd", "w", encoding="utf-8", newline="") as f:
+        f.write("@echo off" + chr(13) + chr(10) + '"%s" "%%~dp0%s" %%*' % (py, os.path.basename(rec_path)) + chr(13) + chr(10))
+    rec_engine = rec_path + ".cmd"
+else:
+    rec_engine = rec_path
+
+
+def recorded_calls():
+    if not os.path.exists(rec_calls):
+        return []
+    with open(rec_calls, encoding="utf-8") as f:
+        return [l for l in f.read().splitlines() if l.strip()]
+
+
+prov_sec = new_prov(cfg={"rsrs": rec_engine})
+prov_sec._engine = rec_engine
+prov_sec.prefetch("普通对照查询触发召回")   # 对照组：普通 query 走引擎（证明桩登记与普通路径都活着）
+check("对照：普通 query 进引擎（桩登记有效）", len(recorded_calls()) >= 1, recorded_calls())
+calls_before = len(recorded_calls())
+r_sec = prov_sec.prefetch(CRED_QUERY)
+check("凭据 query 回 SECRET_SKIP", r_sec == mod.SECRET_SKIP, r_sec)
+check("凭据 query 零引擎调用", len(recorded_calls()) == calls_before, recorded_calls())
+check("SECRET_SKIP 回显不含凭据值", CRED not in (r_sec or ""))
+_log_text = open(os.environ["RESPITE_LOG"], encoding="utf-8").read()
+check("插件日志不含凭据值", CRED not in _log_text)
+check("日志只记固定事件码", '"ev": "prefetch"' in _log_text and '"out": "secret_skip"' in _log_text
+      and CRED_QUERY not in _log_text, _log_text[-200:])
+
 
 # ---- 6) 纯函数 ----
 check("extract_title 整句优先", mod.extract_title("respire 插件迁至独立仓。后续以仓库为准。") == "respire 插件迁至独立仓。")
@@ -291,7 +350,7 @@ doc = {"details": [{"score": 0.6, "id": "aaaabbbbccccdddd", "title": "t1"},
                    {"score": 0.3, "id": "eeeeffff00001111", "title": "t2"}]}
 txt, n = mod.format_recall(doc, 5, 0.5, 1500)
 check("format_recall 阈值过滤", n == 1 and "t2" not in txt, txt)
-check("format_recall 头行条数一致", re.search(r"命中 1 条", txt), txt)
+check("format_recall 头行条数一致", re.search(r"matched 1 item", txt), txt)
 
 # ---- 7) CLI 装配 ----
 import argparse
@@ -332,7 +391,7 @@ if ENGINE:
         first = None
     if first:
         shown = prov_r.handle_tool_call("respire_show", {"id": str(first["id"])[:8]})
-        check("真库 show 读全文", "【respire·条目】" in shown, str(shown)[:120])
+        check("真库 show 读全文", "【respire · entry】" in shown, str(shown)[:120])
     else:
         print("SKIP  真库 show（空库无条目）")
     pf = prov_r.prefetch("respire 信封结构")
