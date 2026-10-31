@@ -47,6 +47,16 @@ def main() -> int:
         check("plugin.yaml version x.y.z", bool(m and re.fullmatch(r"\d+\.\d+\.\d+", m.group(1))))
         version = m.group(1) if m else ""
 
+    # 2.5) 运行代码 VERSION 与发布清单一致（不一致=运行行为与发布声明脱节）
+    init_src = open(os.path.join(ROOT, "__init__.py"), encoding="utf-8").read()
+    m_init = re.search(r'^VERSION\s*=\s*"([^"]+)"', init_src, re.M)
+    init_ver = m_init.group(1) if m_init else None
+    if version and init_ver and version == init_ver:
+        check(f"__init__.py VERSION matches plugin.yaml ({version})", True)
+    else:
+        check(f"__init__.py VERSION matches plugin.yaml ({version})", False,
+              f"__init__.py VERSION={init_ver!r} != plugin.yaml version={version!r}")
+
     # 3) __init__.py 可编译
     try:
         py_compile.compile(os.path.join(ROOT, "__init__.py"), doraise=True)

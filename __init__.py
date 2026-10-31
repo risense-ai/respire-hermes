@@ -26,7 +26,7 @@ import threading
 import time
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 PROVIDER_NAME = "respire"
 
 logger = logging.getLogger("hermes.plugins.respire")
