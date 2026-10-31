@@ -132,7 +132,7 @@ check("prefetch 空 query None", prov.prefetch("") is None)
 check("prefetch 非 str 容错 None", prov.prefetch(123) is None)
 check("prefetch /nomem 跳过", prov.prefetch("/nomem rsrs 信封") is None)
 check("prefetch #nomem 跳过", prov.prefetch("#nomem rsrs 信封") is None)
-check("prefetch 疑似凭据拦截", prov.prefetch("api_key = sk-abcdefghijklmnopqrst 存一下") == mod.SECRET_SKIP)
+check("prefetch 疑似凭据拦截", prov.prefetch("api_key = " + "sk-" + "kvbbfuzkmrhtrxhbvqda" + " 存一下") == mod.SECRET_SKIP)
 check("prefetch 疑似凭据不落库", "记：数据库密码 = hunter2u".startswith("记") and mod.contains_secret("记：数据库密码 = hunter2u"))
 check("prefetch 单字过短 None", prov.prefetch("嗯") is None)
 
@@ -267,6 +267,59 @@ check("新鲜落库不催（问库路径）", isinstance(out7, str) and "记忆�
 stub_miss = new_prov(cfg={"rsrs": stub_engine(recall_hit=False)})
 out8 = stub_miss.prefetch("无关桩查询")
 check("零命中静默注入", out8 is None, out8)
+
+# ---- 5b) secret-skip 回归：凭据 query 不进引擎、不落日志、不回显 ----
+# 合成凭据运行时拼接（避免测试文件出现 secret-like 字面量）；取无前缀值+Bearer 形态，
+# 因为 redact 只兜 sk-/ghp 等前缀与口令赋值，Bearer 值靠「只记固定事件码」兜底。
+CRED = "synthetic" + "qv7xk2mwje"          # 18 位无前缀合成凭据（redact 不覆盖 → 老代码必泄漏，回归可检）
+CRED_QUERY = "Bearer " + CRED + " 这条含凭据不要入库"
+rec_path = os.path.join(TMP, f"rsrs-recording-{time.time_ns()}")
+rec_calls = rec_path + ".calls"
+with open(rec_path, "w", encoding="utf-8") as f:
+    f.write(f"""#!/usr/bin/env python3
+import json, os, sys
+with open({rec_calls!r}, "a", encoding="utf-8") as c:
+    c.write(" ".join(sys.argv[1:]) + chr(10))
+sub = sys.argv[1] if len(sys.argv) > 1 else ""
+if sub == "recall":
+    print(json.dumps({{"command": "recall", "status": "ok", "details": []}}))
+elif sub == "list":
+    print(json.dumps({{"command": "list", "status": "ok", "details": []}}))
+else:
+    sys.exit(1)
+""")
+os.chmod(rec_path, os.stat(rec_path).st_mode | stat.S_IEXEC)
+if os.name == "nt":
+    # Windows：python 脚本不能被 CreateProcess 直接 exec，包一层 .cmd（同上 stub_engine）
+    py = sys.executable
+    with open(rec_path + ".cmd", "w", encoding="utf-8", newline="") as f:
+        f.write("@echo off" + chr(13) + chr(10) + '"%s" "%%~dp0%s" %%*' % (py, os.path.basename(rec_path)) + chr(13) + chr(10))
+    rec_engine = rec_path + ".cmd"
+else:
+    rec_engine = rec_path
+
+
+def recorded_calls():
+    if not os.path.exists(rec_calls):
+        return []
+    with open(rec_calls, encoding="utf-8") as f:
+        return [l for l in f.read().splitlines() if l.strip()]
+
+
+prov_sec = new_prov(cfg={"rsrs": rec_engine})
+prov_sec._engine = rec_engine
+prov_sec.prefetch("普通对照查询触发召回")   # 对照组：普通 query 走引擎（证明桩登记与普通路径都活着）
+check("对照：普通 query 进引擎（桩登记有效）", len(recorded_calls()) >= 1, recorded_calls())
+calls_before = len(recorded_calls())
+r_sec = prov_sec.prefetch(CRED_QUERY)
+check("凭据 query 回 SECRET_SKIP", r_sec == mod.SECRET_SKIP, r_sec)
+check("凭据 query 零引擎调用", len(recorded_calls()) == calls_before, recorded_calls())
+check("SECRET_SKIP 回显不含凭据值", CRED not in (r_sec or ""))
+_log_text = open(os.environ["RESPITE_LOG"], encoding="utf-8").read()
+check("插件日志不含凭据值", CRED not in _log_text)
+check("日志只记固定事件码", '"ev": "prefetch"' in _log_text and '"out": "secret_skip"' in _log_text
+      and CRED_QUERY not in _log_text, _log_text[-200:])
+
 
 # ---- 6) 纯函数 ----
 check("extract_title 整句优先", mod.extract_title("respire 插件迁至独立仓。后续以仓库为准。") == "respire 插件迁至独立仓。")

@@ -639,7 +639,7 @@ class RespireMemoryProvider(MemoryProvider):
                 if isinstance(pat, str) and pat and q[:len(pat)].lower() == pat.lower():
                     return None
             if contains_secret(q):
-                self._log("prefetch", "secret_skip", q[:40])
+                self._log("prefetch", "secret_skip")  # 只记固定事件码：redact 不覆盖 api_key/token 赋值及 Bearer 值，query 摘要绝不落日志
                 return SECRET_SKIP
             engine = self._engine or find_rsrs(self._cfg)
             m = STORE_PREFIX.match(q)
