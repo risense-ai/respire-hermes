@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.4 — 复审二轮整改：容量清理/TTL 不撤销 unknown/in-flight 保护（PR #6 复核 P2）
+
+### Fixed
+
+- **容量清理只淘汰安全终态 written**（复核 P2 残留缺陷）：「记：」幂等表 `_prefix_stores` 超容（`_PREFIX_STORE_CAP`=200，提取为模块常量便于测试覆写）时不再 `clear()` 全清——改为只淘汰 `state=='written'` 条目（先清 TTL 已过期的，再按 ts 从旧到新）；`in-flight`/`unknown` 永不淘汰。淘汰后仍超容（理论上被未决项占满）→ **保守拒绝新的自动提交**：prefetch「记：」路径回固定回执（"memory idempotency table saturated with unresolved outcomes; store manually via rsrs and verify read-only"）、不发起 `do_store`——无界内存不增长，且未决结果的防重发保护不因容量清理失效（旧实现 clear() 曾让 unknown 项被重复提交、in-flight 预占被并发重穿）。
+- **unknown 永不过期重发**：1800s TTL 收窄为模块常量 `_PREFIX_STORE_TTL` 且**只作用于 `written`**（过期=可安全再存）；`unknown` 状态无 TTL——重复 prefetch 永远走「只读核实、绝不重发」回执；`in-flight` 无 TTL（本就短时，完成后即迁移）。旧代码「unknown 超 30 分钟后自动重写」路径不复存在。
+
+### Changed
+
+- 版本 0.1.3 → 0.1.4（plugin.yaml 与 `__init__.py VERSION` 两处）。
+- 测试：provider 套件新增 28 项复审二轮反例断言（150 → 178）：① unknown＋超容未决项＋再次触发→零第二次 remember；② in-flight＋容量清理＋并发重发→仍只一次 remember；③ unknown 远超 1800s（直接改内部 ts）仍拒重发＋written 过期可再存对照；④ 容量淘汰只清 written（先过期、再最旧）、unknown 在容量压力下存活、饱和后表规模有界。容量测试以 `mod._PREFIX_STORE_CAP=3` 覆写避免真造 200 键；负对照已在临时副本上验证（回植旧 clear()/TTL 全态两缺陷 → 17 项 FAIL）。
+
 ## 0.1.3 — 复审整改：原子幂等预占＋回执/回读加固（PR #6 复核意见 #1/#2）
 
 ### Fixed

@@ -5,7 +5,7 @@
 - 每轮 `prefetch`：按当轮 query 自动召回标题档（分数＋短 id＋标题，预算内截断），正文按需 `respire_show`
 - `system_prompt_block`：注入记忆用法简则＋引擎状态引导（未装引擎/未登录/空库/缺语义模型时才出对应段，否则零打扰）
 - 三个工具：`respire_recall` / `respire_show` / `respire_remember`（判后即存：相似会给候选，挂靠或直写由模型决断）
-- 消息以「记：」「存：」「remember:」开头 → provider 直接落库保底并回执，**回执按结果状态机**：`ok`/`warn`＋有效 id=已写入（warn 附警告；show **全量回读核验**——条目 id/标题/完整正文，缺或畸形 id 不当有效）；`pending`=未写候选＋引擎建议动作（改＞并＞挂＞存）；`skip`=引擎按只读/暂停模式拒绝（未写也不是失败，绝不强写）；`fail`=唯一明确拒绝态；其余一切（超时/坏回执/缺 id/陌生状态）=**unknown**（回执只允许只读核实、明令禁重发）；**同会话同内容幂等预占**（HM-04：调用前原子登记 in-flight，并发重复只发一次；`written`/`unknown` 保持占用——unknown 后重复 prefetch 绝不自动重发，只引导只读核实；`pending`/`fail`/`skip` 未写可再试；30 分钟窗）；回读与只读核实共享预算（`RESPITE_HOOK_BUDGET_S` 可覆盖总窗，剩余 <1.5s 跳过）；改题用 shell `rsrs retitle`（respire_remember 只能新存，HM-03）；`/nomem` 前缀关闭当轮自动召回
+- 消息以「记：」「存：」「remember:」开头 → provider 直接落库保底并回执，**回执按结果状态机**：`ok`/`warn`＋有效 id=已写入（warn 附警告；show **全量回读核验**——条目 id/标题/完整正文，缺或畸形 id 不当有效）；`pending`=未写候选＋引擎建议动作（改＞并＞挂＞存）；`skip`=引擎按只读/暂停模式拒绝（未写也不是失败，绝不强写）；`fail`=唯一明确拒绝态；其余一切（超时/坏回执/缺 id/陌生状态）=**unknown**（回执只允许只读核实、明令禁重发）；**同会话同内容幂等预占**（HM-04：调用前原子登记 in-flight，并发重复只发一次；`written`/`unknown` 保持占用——unknown 后重复 prefetch 绝不自动重发，只引导只读核实；`pending`/`fail`/`skip` 未写可再试；written 30 分钟过期=可安全再存；**unknown/in-flight 永不因容量或 TTL 失效；容量满时只淘汰 written（先过期再最旧）、淘汰不动时保守拒绝新自动提交**——回执指引手动 rsrs 落库＋只读核实）；回读与只读核实共享预算（`RESPITE_HOOK_BUDGET_S` 可覆盖总窗，剩余 <1.5s 跳过）；改题用 shell `rsrs retitle`（respire_remember 只能新存，HM-03）；`/nomem` 前缀关闭当轮自动召回
 - 每轮结束检查近窗落库，闲聊零打扰、干完活没存才催——**零命中/新主题/空库同样催**（HM-01：判定不再依赖召回命中），催促明示为当前任务的附加项、绝不替代当前任务（HM-05）
 - fail-open：引擎缺失/超时/解析失败一律降级为空注入，绝不阻断宿主回合
 

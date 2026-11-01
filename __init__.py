@@ -27,7 +27,7 @@ import threading
 import time
 from pathlib import Path
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 PROVIDER_NAME = "respire"
 
 logger = logging.getLogger("hermes.plugins.respire")
@@ -66,6 +66,13 @@ PROBE_T = 10
 STORE_T = 18
 LIST_T = 30   # 「近窗落库」检查窗口（1.0.16 冷启动实测可达 27s；热态约 0.3–0.9s）
 LOG_MAX = 256 * 1024  # plugin.log 超此整文件清轮
+
+# 「记：」幂等表（_prefix_stores）容量/TTL（0.1.4 复审二轮，模块常量便于测试覆写）：
+#   容量超 _PREFIX_STORE_CAP 只淘汰安全终态 written（先 TTL 已过期、再 ts 最旧）；
+#   in-flight/unknown 永不淘汰、永不因 TTL 失效——未知/未决结果的防重发保护绝不因容量或过期撤销；
+#   淘汰后仍超容（被未决项占满）→ 保守拒绝新的自动提交（无界内存不增长、保护不破坏）。
+_PREFIX_STORE_CAP = 200
+_PREFIX_STORE_TTL = 1800  # 仅作用于 written：过期=可安全再存（unknown/in-flight 无 TTL）
 
 DEFAULTS = {
     "rsrs": "",                 # respire 引擎（rsrs）路径；空 = 自动探测（向导字段 rsrs_path 落此键）
@@ -582,7 +589,8 @@ class RespireMemoryProvider(MemoryProvider):
         self._probe = None          # (logged, total, probe_ok) 缓存
         self._probe_at = 0.0
         self._last_store_ts = None  # 引擎侧最近落库 epoch（后台刷）
-        self._prefix_stores = {}    # 显式「记：」幂等预占：{key: {"ts":…, "state":"in-flight|written|unknown"}}（HM-04）
+        self._prefix_stores = {}    # 显式「记：」幂等预占：{key: {"ts":…, "state":"in-flight|written|unknown"}}（HM-04；
+        #                             0.1.4：in-flight/unknown 永不淘汰/过期；容量超限只淘汰 written，见 _evict_written）
         self._turns = 0
         self._threads = []
 
@@ -803,24 +811,34 @@ class RespireMemoryProvider(MemoryProvider):
                 if not engine:
                     return NO_RSRS
                 rest = q[m.end():].strip()
-                # HM-04 幂等预占（整改）：调用 do_store **前**在锁内一步完成「检查＋登记 in-flight」，
-                # 并发重复请求不可能同时通过检查；结果三态迁移：
-                #   written（ok/warn）→ 保持占用，重复触发回 already-submitted 回执；
-                #   unknown（超时/坏回执/缺 id）→ 保持占用，回执只允许只读核实、明令禁止重发；
+                # HM-04 幂等预占（0.1.4 复审二轮加固）：调用 do_store **前**在锁内一步完成
+                # 「检查＋登记 in-flight」，并发重复请求不可能同时通过检查；结果三态迁移：
+                #   written（ok/warn）→ 保持占用（TTL _PREFIX_STORE_TTL，过期=可安全再存），
+                #                        重复触发回 already-submitted 回执；
+                #   unknown（超时/坏回执/缺 id）→ 永不淘汰、永不过期，回执只允许只读核实、明令禁止重发；
+                #   in-flight → 永不淘汰、无 TTL（本就短时，完成后即迁移）；
                 #   pending/fail/skip（明确未写）→ 删除键，允许模型决断后再试。
-                # 30 分钟窗与 200 条上限保留。
+                # 容量超 _PREFIX_STORE_CAP：只淘汰安全终态 written（先过期、再最旧，见 _evict_written）；
+                # 淘汰后仍超容（被未决项占满）→ 保守拒绝本条自动提交（固定回执，不发起 do_store）。
                 key = hashlib.sha1((session_id or self._session_id or "").encode("utf-8", "replace")
                                    + b"\x00" + rest.strip().encode("utf-8", "replace")).hexdigest()
                 now = time.time()
+                saturated = False
                 with self._lock:
                     prev = self._prefix_stores.get(key)
-                    if isinstance(prev, dict) and now - prev.get("ts", 0) < 1800:
-                        state = str(prev.get("state") or "")
-                    else:
-                        if len(self._prefix_stores) > 200:
-                            self._prefix_stores.clear()
-                        self._prefix_stores[key] = {"ts": now, "state": "in-flight"}  # 原子预占
-                        state = ""
+                    state = ""
+                    if isinstance(prev, dict):
+                        st = str(prev.get("state") or "")
+                        # unknown/in-flight 永不因 TTL 失效（复审二轮：旧 30 分钟窗曾让 unknown 过期重发）
+                        if st in ("in-flight", "unknown") or (
+                                st == "written" and now - prev.get("ts", 0) < _PREFIX_STORE_TTL):
+                            state = st
+                    if not state:  # 需新占位：先容量淘汰——只淘汰安全终态 written，未决项永不淘汰
+                        if len(self._prefix_stores) > _PREFIX_STORE_CAP:
+                            self._evict_written(now)
+                            saturated = len(self._prefix_stores) > _PREFIX_STORE_CAP
+                        if not saturated:
+                            self._prefix_stores[key] = {"ts": now, "state": "in-flight"}  # 原子预占
                 if state == "in-flight":
                     self._log("store", "prefix_inflight_skip", rest[:40])
                     return ("【respire · store】The same store request is already in flight in this session; "
@@ -835,6 +853,14 @@ class RespireMemoryProvider(MemoryProvider):
                     return ("【respire · store】A previous attempt for this exact content returned an unknown result; "
                             "verify read-only (rsrs list --limit 3 --json, then rsrs show <id>) and never resend "
                             "respire_remember for the same fact — resending can duplicate an already-committed write.")
+                if saturated:
+                    # 保守拒绝（0.1.4 复审二轮）：幂等表被未决项占满——淘汰不动 in-flight/unknown 是刻意为之
+                    # （防重发保护不因容量失效），代价是本条自动提交不发起，交还手动落库＋只读核实。
+                    self._log("store", "prefix_table_saturated", rest[:40])
+                    return ("【respire · store】Not sent: memory idempotency table saturated with unresolved outcomes; "
+                            "store manually via rsrs and verify read-only (rsrs list --limit 3 --json, then rsrs show "
+                            "<id>). In-flight/unknown stores never lose their duplicate protection, so new automatic "
+                            "stores are conservatively rejected.")
                 self._log("store", "prefix", rest[:40])
                 out = do_store(engine, rest)
                 with self._lock:
@@ -946,6 +972,25 @@ class RespireMemoryProvider(MemoryProvider):
                   "配置文件 $HERMES_HOME/respire.json（可选字段见插件 README）。")
 
     # ---- 内部 ----
+
+    def _evict_written(self, now: float) -> None:
+        """幂等表容量淘汰（0.1.4 复审二轮）：**只淘汰安全终态 written**——先清 TTL 已过期的
+        written（本就可再存、留着只占位），再按 ts 从旧到新淘汰其余 written，直到规模回到上限内。
+        in-flight/unknown 永不淘汰：未知/未决结果的防重发保护绝不因容量清理失效
+        （旧实现 clear() 全清曾让未决项失去保护、可被重复提交）。调用方须已持有 self._lock。"""
+        for k in [k for k, v in self._prefix_stores.items()
+                  if isinstance(v, dict) and str(v.get("state") or "") == "written"
+                  and now - float(v.get("ts") or 0) >= _PREFIX_STORE_TTL]:
+            self._prefix_stores.pop(k, None)
+        if len(self._prefix_stores) <= _PREFIX_STORE_CAP:
+            return
+        oldest = sorted((k for k, v in self._prefix_stores.items()
+                         if isinstance(v, dict) and str(v.get("state") or "") == "written"),
+                        key=lambda k: float(self._prefix_stores[k].get("ts") or 0))
+        for k in oldest:
+            if len(self._prefix_stores) <= _PREFIX_STORE_CAP:
+                break
+            self._prefix_stores.pop(k, None)
 
     def _data_dir(self) -> str:
         base = self._hermes_home or os.path.dirname(os.path.abspath(__file__))

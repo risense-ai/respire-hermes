@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import re
@@ -685,6 +686,156 @@ try:
 finally:
     os.environ.pop("RESPITE_HOOK_BUDGET_S", None)
     mod.os.environ.pop("RESPITE_HOOK_BUDGET_S", None)
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"
+
+
+# ---- 11c) 复审二轮（0.1.4，PR #6 复核 P2）：容量清理/TTL 不得撤销 unknown/in-flight 保护 ----
+# 容量上限覆写为小值（模块常量 mod._PREFIX_STORE_CAP，避免真造 200 键）；TTL 用真值 1800s，
+# 直接改 _prefix_stores 内部 ts 模拟「远超 1800s」（复审建议的 mtime/时钟注入等价手法）。
+def _pkey(content):
+    """与 provider 同口径计算「记：」幂等键（session 固定 selftest；rest=去前缀内容）。"""
+    return hashlib.sha1(b"selftest" + b"\x00" + content.strip().encode("utf-8", "replace")).hexdigest()
+
+
+_CAP_SAVED = mod._PREFIX_STORE_CAP
+try:
+    mod._PREFIX_STORE_CAP = 3
+
+    # ① unknown A ＋ 超容个未决键 ＋ 再次 A → A 仍只读核实、绝无第二次 remember
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "silent"
+    sb_cap = store_stub("silent")
+    prov_cap = new_prov(cfg={"rsrs": sb_cap})
+    prov_cap._engine = sb_cap
+    out_a1 = prov_cap.prefetch("记：capacity unknown protected fact A.")
+    check("① unknown A 首发归 unknown", isinstance(out_a1, str) and "store unknown" in out_a1, out_a1)
+    for _fill in ("capacity unresolved filler one.", "capacity unresolved filler two.",
+                  "capacity unresolved filler three."):
+        prov_cap.prefetch(f"记：{_fill}")            # 各自 unknown 占位 → 表内含 A 共 4 个未决
+    out_fill4 = prov_cap.prefetch("记：capacity unresolved filler four.")  # len=4>3 → 淘汰路径
+    _states_cap = sorted(str(v.get("state")) for v in prov_cap._prefix_stores.values())
+    check("① 超容被未决项占满（旧代码此处已 clear 全清）", _states_cap == ["unknown"] * 4, _states_cap)
+    check("① 未决项占满时保守拒绝新自动提交", isinstance(out_fill4, str)
+          and "saturated with unresolved outcomes" in out_fill4
+          and "store manually via rsrs" in out_fill4 and "verify read-only" in out_fill4, out_fill4)
+    _sat2 = prov_cap.prefetch("记：capacity saturated stays bounded fact.")
+    check("① 保守拒绝后表规模有界不增长", isinstance(_sat2, str) and "saturated with unresolved outcomes" in _sat2
+          and len(prov_cap._prefix_stores) <= 4, len(prov_cap._prefix_stores))
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"    # 引擎恢复健康，诱惑重发
+    _before_a = stub_calls(sb_cap).count("remember")
+    out_a2 = prov_cap.prefetch("记：capacity unknown protected fact A.")
+    check("① unknown A 经容量清理后仍拒重发", isinstance(out_a2, str)
+          and "returned an unknown result" in out_a2 and "never resend" in out_a2, out_a2)
+    check("① unknown A 绝无第二次 remember", stub_calls(sb_cap).count("remember") == _before_a,
+          stub_calls(sb_cap))
+
+    # ② in-flight A ＋ 容量清理（filler 触发淘汰路径）＋ 并发 A → 仍无第二次 remember
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "silent"
+    sb_if = store_stub("silent")
+    prov_if = new_prov(cfg={"rsrs": sb_if})
+    prov_if._engine = sb_if
+    prov_if.prefetch("记：inflight filler one.")         # unknown 占位
+    prov_if.prefetch("记：inflight filler two.")         # unknown 占位
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "slow_garbage"  # B 的 remember 睡 2.5s：可观测 in-flight 窗
+    _if_first = {}
+
+    def _if_store():
+        _if_first["out"] = prov_if.prefetch("记：inflight capacity protected fact B.")
+
+    _t_if = threading.Thread(target=_if_store)
+    _t_if.start()
+    _dl = time.time() + 10
+    while stub_calls(sb_if).count("remember") < 3 and time.time() < _dl:
+        time.sleep(0.05)    # 等 B 的 remember 进桩（进程起跑即记账）——此刻 B 必已锁内登记 in-flight
+    check("② B 已在桩内 in-flight（remember 已记账）", stub_calls(sb_if).count("remember") >= 3,
+          stub_calls(sb_if))
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "silent"
+    prov_if.prefetch("记：inflight filler three.")       # len 3→4（unknown）
+    out_if_c = prov_if.prefetch("记：inflight filler four.")    # len=4>3 → 淘汰路径跑过、B 不得被删
+    check("② 容量清理不动 in-flight（保守拒绝而非腾位重发）", isinstance(out_if_c, str)
+          and "saturated with unresolved outcomes" in out_if_c, out_if_c)
+    _st_b = prov_if._prefix_stores.get(_pkey("inflight capacity protected fact B."), {}).get("state")
+    check("② B 经容量清理后仍在表内（in-flight/unknown）", _st_b in ("in-flight", "unknown"),
+          prov_if._prefix_stores)
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"    # 引擎恢复健康，诱惑重发
+    _if_retry = []
+
+    def _if_retry_store():
+        _if_retry.append(prov_if.prefetch("记：inflight capacity protected fact B."))
+
+    _trs = [threading.Thread(target=_if_retry_store) for _ in range(2)]
+    for _t in _trs:
+        _t.start()
+    for _t in _trs:
+        _t.join()
+    _t_if.join()
+    check("② 并发重复 B 全部走保护回执、无一重发", all(isinstance(o, str) and ("already in flight" in o
+          or "returned an unknown result" in o or "already submitted" in o) and "Saved:" not in o
+          for o in _if_retry), _if_retry)
+    check("② in-flight 全程绝无第二次 remember（filler1/2+B+filler3=4 次）",
+          stub_calls(sb_if).count("remember") == 4, stub_calls(sb_if))
+    check("② B 首发垃圾回执归 unknown", isinstance(_if_first.get("out"), str)
+          and "store unknown" in _if_first["out"], _if_first)
+    out_if_b2 = prov_if.prefetch("记：inflight capacity protected fact B.")
+    check("② B 终态 unknown 仍拒重发", isinstance(out_if_b2, str) and "returned an unknown result" in out_if_b2
+          and stub_calls(sb_if).count("remember") == 4, out_if_b2)
+
+    # ③ 「过期 unknown」路径不存在：unknown 无 TTL——远超 1800s 后重复 prefetch 仍拒重发；
+    #    对照 written 过期（>TTL）= 安全终态、允许再存（TTL 语义仅作用于 written）
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "silent"
+    sb_ttl = store_stub("silent")
+    prov_ttl = new_prov(cfg={"rsrs": sb_ttl})
+    prov_ttl._engine = sb_ttl
+    prov_ttl.prefetch("记：ttl unknown never expires fact.")
+    _k_u = next(iter(prov_ttl._prefix_stores))
+    prov_ttl._prefix_stores[_k_u]["ts"] = time.time() - (mod._PREFIX_STORE_TTL + 7200)  # 远超 TTL
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"
+    _before_t = stub_calls(sb_ttl).count("remember")
+    out_t2 = prov_ttl.prefetch("记：ttl unknown never expires fact.")
+    check("③ unknown 远超 1800s 仍拒重发（无过期路径）", isinstance(out_t2, str)
+          and "returned an unknown result" in out_t2 and "never resend" in out_t2, out_t2)
+    check("③ unknown 远超 TTL 零重发调用", stub_calls(sb_ttl).count("remember") == _before_t,
+          stub_calls(sb_ttl))
+    prov_ttl.prefetch("记：ttl written expires restorable fact.")      # ok 模式 → written
+    _k_ws = [k for k, v in prov_ttl._prefix_stores.items() if str(v.get("state")) == "written"]
+    check("③ 对照 written 登记在册", len(_k_ws) == 1, prov_ttl._prefix_stores)
+    prov_ttl._prefix_stores[_k_ws[0]]["ts"] = time.time() - (mod._PREFIX_STORE_TTL + 7200)
+    _before_w = stub_calls(sb_ttl).count("remember")
+    out_t3 = prov_ttl.prefetch("记：ttl written expires restorable fact.")
+    check("③ 对照 written 过期后允许再存（安全终态）", isinstance(out_t3, str) and "Saved:" in out_t3, out_t3)
+    check("③ 对照 written 过期再存确走引擎", stub_calls(sb_ttl).count("remember") == _before_w + 1,
+          stub_calls(sb_ttl))
+
+    # ④ 容量淘汰只清安全终态 written：先清过期、再按最旧淘汰其余 written；unknown 存活、新键可入
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"
+    sb_ev = store_stub("ok")
+    prov_ev = new_prov(cfg={"rsrs": sb_ev})
+    prov_ev._engine = sb_ev
+    prov_ev.prefetch("记：evict written oldest fact one.")             # written（最旧）
+    prov_ev.prefetch("记：evict written second fact two.")             # written
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "silent"
+    prov_ev.prefetch("记：evict unknown keeper fact three.")           # unknown（不可淘汰）
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"
+    out_ev4 = prov_ev.prefetch("记：evict newcomer fact four.")        # len 3→4（3 不> 3，不触发淘汰）
+    check("④ 未超容前新键可入（不淘汰）", isinstance(out_ev4, str) and "Saved:" in out_ev4, out_ev4)
+    out_ev5 = prov_ev.prefetch("记：evict after oldest fact five.")    # len=4>3 → 淘汰最旧 written#1 让位
+    check("④ 超容淘汰最旧 written 后新键可存", isinstance(out_ev5, str) and "Saved:" in out_ev5, out_ev5)
+    check("④ 最旧 written 被淘汰", _pkey("evict written oldest fact one.") not in prov_ev._prefix_stores,
+          sorted(prov_ev._prefix_stores))
+    check("④ 较新 written 保留", _pkey("evict written second fact two.") in prov_ev._prefix_stores,
+          sorted(prov_ev._prefix_stores))
+    check("④ unknown 在容量压力下存活", prov_ev._prefix_stores.get(
+        _pkey("evict unknown keeper fact three."), {}).get("state") == "unknown", prov_ev._prefix_stores)
+    check("④ 淘汰后表规模有界（≤cap+1）", len(prov_ev._prefix_stores) <= 4, len(prov_ev._prefix_stores))
+    prov_ev._prefix_stores[_pkey("evict newcomer fact four.")]["ts"] = time.time() - (mod._PREFIX_STORE_TTL + 60)
+    out_ev6 = prov_ev.prefetch("记：evict expired first fact six.")    # 过期 written 优先被清、让位成功
+    check("④ 过期 written 优先淘汰后仍有位", isinstance(out_ev6, str) and "Saved:" in out_ev6, out_ev6)
+    check("④ 过期 written 已被清理", _pkey("evict newcomer fact four.") not in prov_ev._prefix_stores,
+          sorted(prov_ev._prefix_stores))
+    check("④ 未过期 written 不误删", _pkey("evict after oldest fact five.") in prov_ev._prefix_stores,
+          sorted(prov_ev._prefix_stores))
+    check("④ 全程 6 次 remember、零保守拒绝", stub_calls(sb_ev).count("remember") == 6, stub_calls(sb_ev))
+finally:
+    mod._PREFIX_STORE_CAP = _CAP_SAVED
     mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"
 
 
