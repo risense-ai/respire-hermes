@@ -1,29 +1,29 @@
 ---
 name: respire
-description: respire（rsrs）本地加密记忆操作法（Hermes memory provider 版）。每轮自动召回已随 system prompt 注入；未见注入、命中不贴题、或涉旧（项目、报错、约定、日期）都须换词补查（同义词/上位词/英文词分路试）；工具 respire_recall 翻忆、respire_remember 判后即存、respire_show 读全文；消息以「记：」开头由本层直接落库，「/nomem」前缀关闭本轮召回。触发词：记忆、翻忆、recall、remember、存记忆、忘掉、同步。
+description: respire (rsrs) local encrypted memory playbook (Hermes memory provider edition). Automatic per-turn recall is injected with the system prompt; if no injection is present, the hits are off-topic, or the topic involves an earlier project, error, agreement, or date, recall again with different wording (synonyms, hypernyms, English equivalents, one route each); tools respire_recall to search, respire_remember to store after judging, respire_show to read full bodies; a message starting with "记：" is stored directly by this layer; the "/nomem" prefix disables recall for the turn. Triggers: memory, recall, remember, store memory, forget, sync, 记忆, 翻忆, 存记忆, 忘掉, 同步.
 ---
 
-# respire · 记忆操作法（Hermes）
+# respire · memory playbook (Hermes)
 
-本 provider 行为：system prompt 注简则＋状态引导；每轮 prefetch 自动召回（rsrs 自带无关过滤（零命中即 skip），本层再按阈值兜底）；消息以「记：」「存：」「remember:」开头由本层先落库保底并回执——**回执带暂拟标题与短 id 时，你须从事实抽取「主语＋动作＋结果」完整句替换标题（rsrs retitle <短id> --title，硬约束，title 是召回与判重的门面）**；`/nomem` 关本轮；每轮结束若近 10 分钟库无落库且本轮有新事实，下轮注入催存提示。
+Provider behavior: the system prompt carries the brief rules plus status guidance; every turn prefetch auto-recalls (rsrs skips irrelevant queries itself — zero hits = skip; this layer also applies a threshold backstop); a message starting with "记：", "存：", or "remember:" is stored first by this layer as a fallback and returns a receipt — **when the receipt includes a provisional title and short id, extract a complete "subject + action + result" sentence from the facts and replace the title (`rsrs retitle <short-id> --title`; hard rule — the title is the facade for recall and dedup)**; `/nomem` disables recall for the turn; at the end of a turn with new facts and no store in the last 10 minutes, a store nudge rides the next injection.
 
-## 工具与命令
+## Tools and commands
 
-- `respire_recall(query, limit?)` —— 答前必查（注入为空绝不等于无记忆，须自行补查）；报错先按报错原文翻忆。等价 shell：`rsrs recall "项目名+关键词" --limit 5 --json --titles`
-- `respire_remember(content, title?, importance?, parent?, force?)` —— 一事一条，先判后存；`pending` 回执=判为相似未写入，`parent` 挂靠或 `force` 直写
-- `respire_show(id)` —— 短 id 前 8 位即可读全文（含因果链上下文）；`rsrs chain` 一次取整条因果链
-- shell 直通：`rsrs forget <id>`（墓碑删除）、`rsrs candidates`（存前候选账）、`rsrs sync`（双向同步，autosync 常开）、`rsrs status`、`rsrs prompt`（完整工作流）、`rsrs tree/resort/retitle`（因果树整理）
+- `respire_recall(query, limit?)` — recall before answering (an empty injection never means no memory; search manually); on errors, recall by the original error text first. Equivalent shell: `rsrs recall "project name + keywords" --limit 5 --json --titles`
+- `respire_remember(content, title?, importance?, parent?, force?)` — one item per record, judge before storing; a `pending` receipt means a similar record was found and nothing was written — attach with `parent` or force with `force`
+- `respire_show(id)` — the first 8 chars of the id suffice to read the full body (with causal-chain context); `rsrs chain` fetches the whole causal chain
+- shell passthrough: `rsrs forget <id>` (tombstone delete), `rsrs candidates` (pre-store candidate list), `rsrs sync` (two-way sync, autosync on), `rsrs status`, `rsrs prompt` (full workflow, on demand), `rsrs tree/resort/retitle` (causal tree upkeep)
 
-## 解析要点（CLI 信封）
+## Parsing notes (CLI envelope)
 
-- 一切 rsrs 命令 `--json` 走统一信封：`status`、`summary`、`items`、`details`、`errors`；**失败也是 HTTP 200＋`status:"fail"`＋`errors[]`**，须查 status 不查退出码
-- recall 的分数与条目在 `details[].score`、`details[].id`（全 id，取前 8 位当短 id）、`details[].title`、`details[].superseded_by`
-- 进度写 stderr，勿 `2>&1` 混进 JSON
-- remember 判后即存：`status:"ok"`＝已写入（summary.id）；`status:"pending"`＋`written:false`＝判为相似**未写入**
-- 默认 `trivial` 档进日记区、不进召回主区——事实类落库用 `importance="important"`
+- Every rsrs command with `--json` uses one envelope: `status`, `summary`, `items`, `details`, `errors`; **failures also return HTTP 200 with `status:"fail"` and `errors[]`** — check status, not the exit code
+- recall scores and entries live in `details[].score`, `details[].id` (full id; use the first 8 chars as the short id), `details[].title` and `details[].superseded_by`
+- Progress goes to stderr; never mix it into JSON with `2>&1`
+- remember stores after judgement: `status:"ok"` means written (`summary.id`); `status:"pending"` plus `written:false` means a similar record was found and **nothing was written**
+- The default `trivial` tier goes to the diary area, excluded from recall — use `importance="important"` for factual records
 
-## 红线
+## Red lines
 
-- 口令、证件号、手机号、卡号、私钥禁入记忆正文与查询词，只写存放位置——库虽加密，密钥泄露即裸奔
-- 召回分数是相关度不是可信度；存前判重，改＞并＞挂＞存
-- 账号与同步配置不归本 provider 管：注册去 rsrs.rs，本机 `rsrs register`／`rsrs login`，provider 不代办
+- Never put passwords, ID numbers, phone numbers, card numbers, or private keys into memory bodies or query terms; record only where they are stored — the library is encrypted, but a leaked key exposes everything
+- Recall scores are relevance, not confidence; check dedup before storing, prefer edit > merge > attach > new
+- Account and sync configuration are outside this provider: run `rsrs register` / `rsrs login` on this machine (no website step); the provider does not handle it
