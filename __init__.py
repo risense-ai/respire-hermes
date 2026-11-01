@@ -27,7 +27,7 @@ import threading
 import time
 from pathlib import Path
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 PROVIDER_NAME = "respire"
 
 logger = logging.getLogger("hermes.plugins.respire")
@@ -284,32 +284,57 @@ def do_recall(bin_path: str, query: str, limit: int, threshold: float, budget: i
 SHOW_T = 8    # 写后回读（show）窗口
 
 
-def _readback(bin_path: str, sid: str, title: str, content: str):
-    """写后核验（R11）：show 回读，校验条目存在且标题/正文头一致。
-    返回 verified / mismatch / unavailable。"""
+def _budget_left(t0: float) -> float:
+    """remember 后剩余共享预算（秒）：总窗 RESPITE_HOOK_BUDGET_S 可覆盖（默认 20s）－2.5s 呼吸保留－已耗。
+    环境变量解析失败按默认窗，绝不抛异常（回执丢失比预算保守更糟）。"""
+    try:
+        total = float(os.environ.get("RESPITE_HOOK_BUDGET_S") or 20)
+    except Exception:
+        total = 20.0
+    return total - 2.5 - (time.time() - t0)
+
+
+def _readback(bin_path: str, sid: str, title: str, content: str, budget_s: float = SHOW_T):
+    """写后核验（R11）：show 回读，**全量核验**——返回条目 summary.id==本条 id、标题相等、
+    完整正文相等（strip 规范化）；任一不符即 mismatch，绝不部分核验宣称 verified。
+    剩余共享预算 <1.5s 直接 unavailable（不发起核实调用，防预算外追加引擎调用）。"""
+    if budget_s < 1.5:
+        return "unavailable"
     t0 = time.time()
     try:
-        r = run_rsrs(bin_path, ["show", sid, "--json"], SHOW_T)
+        r = run_rsrs(bin_path, ["show", sid, "--json"], min(SHOW_T, max(2, int(budget_s))))
         doc = json.loads(r.stdout) if r.stdout else {}
     except Exception:
         return "unavailable"
     if not isinstance(doc, dict) or doc.get("status") != "ok":
         return "unavailable"
-    entry = (doc.get("details") or {}).get("entry")
+    det = doc.get("details")
+    entry = det.get("entry") if isinstance(det, dict) else None
     if not isinstance(entry, dict):
         return "unavailable"
+    summ = doc.get("summary")
+    rid = str(summ.get("id") or "") if isinstance(summ, dict) else ""
+    if rid != sid:  # 返回的是别的条目：不是本条核验通过
+        logger.warning("readback mismatch sid=%s rid=%s %.0fms", sid[:8], rid[:8], (time.time() - t0) * 1000)
+        return "mismatch"
     et, ec = str(entry.get("title") or ""), str(entry.get("content") or "")
-    head = content.strip()[:40]
-    if (bool(title) and et != title) or (bool(head) and head not in ec):
-        logger.warning("readback mismatch sid=%s %.0fms", sid[:8], (time.time() - t0) * 1000)
+    bad_title = bool(title) and et != title
+    bad_body = content.strip() != ec.strip()  # 完整正文比对（去首尾空白规范化）——前缀相同不算
+    if bad_title or bad_body:
+        logger.warning("readback mismatch sid=%s title=%s body=%s %.0fms",
+                       sid[:8], bad_title, bad_body, (time.time() - t0) * 1000)
         return "mismatch"
     return "verified"
 
 
-def _verify_recent_write(bin_path: str, t0: float):
-    """未知写结果的只读核实（R10）：list 近 3 条里是否有 t0 之后落库的条目。返回 (id, title) 或 None。"""
+def _verify_recent_write(bin_path: str, t0: float, max_wait: float = 0):
+    """未知写结果的只读核实（R10）：list 近 3 条里是否有 t0 之后落库的条目。返回 (id, title) 或 None。
+    max_wait>0 时受剩余共享预算约束（超时上限取 min(LIST_T, max_wait)），预算外不发核实调用。"""
     try:
-        r = run_rsrs(bin_path, ["list", "--limit", "3", "--json"], min(LIST_T, 6))
+        timeout = LIST_T
+        if max_wait > 0:
+            timeout = max(1, min(LIST_T, int(max_wait)))
+        r = run_rsrs(bin_path, ["list", "--limit", "3", "--json"], timeout)
         doc = json.loads(r.stdout) if r.stdout else None
     except Exception:
         return None
@@ -334,13 +359,14 @@ def _verify_recent_write(bin_path: str, t0: float):
 def do_store(bin_path: str, content: str, title: str = "", importance: str = "important",
              parent: str = "", force: bool = False):
     """写回执状态机（对齐 CLI 信封语义，审计报告 §7.1/§7.2）：
-      ok + summary.id   → 已写入：show 回读核验后回执（verified/mismatch/unavailable 如实标注）
-      warn + summary.id → 已写入但有警告（parent 未解析 / post-remember hook 告警）——
-                          绝不当失败、绝不引导重发；附 errors 摘要并回读
-      pending           → 未写入：转述候选（items 带短 id）＋引擎建议动作（改＞并＞挂＞存）
-      超时/坏信封        → 结果未知：只读核实（list/show），禁止重发 remember
-      其余明确拒绝态    → fail：转述 errors，不自动重试
-    返回回执文本，绝不抛异常。"""
+      ok/warn + 有效 summary.id → 已写入：show 全量回读核验后回执（verified/mismatch/unavailable 如实标注）
+      pending → 未写入：转述候选（items 带短 id）＋引擎建议动作（改＞并＞挂＞存）
+      skip    → 引擎按当前模式拒绝（readonly/paused 等）：未写也不是失败，绝不引导强写
+      fail    → 唯一明确拒绝态（白名单）：转述 errors，断言 did not accept
+      其余一切（陌生状态/缺 id/畸形 id/坏 summary/坏信封/超时）→ 结果 unknown：
+      回执只允许只读核实（list/show）并明令禁止重发；剩余共享预算不足时连核实调用也省。
+    summary 字段类型防护＋id 白名单（十六进制连字至少 8 位）：缺/畸形 id 一律按不可确认处理，
+    不当有效、也不当失败。返回回执文本，绝不抛异常。"""
     if not content:
         return "【respire · store】Content is empty; nothing was stored."
     title = (title or "").strip() or extract_title(content) or "respire quick store"
@@ -366,21 +392,25 @@ def do_store(bin_path: str, content: str, title: str = "", importance: str = "im
     if not isinstance(doc, dict):
         doc = {}
     status = str(doc.get("status") or "")
-    sid = str((doc.get("summary") or {}).get("id") or "") if parse_ok else ""
+    summ = doc.get("summary")
+    sid = str(summ.get("id") or "") if isinstance(summ, dict) else ""  # 非 dict summary 防护
+    if not re.fullmatch(r"[0-9a-fA-F][0-9a-fA-F-]{7,}", sid):
+        sid = ""  # 缺失/畸形 id：不可确认，不当有效也不当失败
 
     # —— 已写入：ok / warn（warn 也是已提交，只是带警告）——
     if parse_ok and sid and status in ("ok", "warn"):
         if status == "warn":
-            warns = [str(e) for e in (doc.get("errors") or []) if isinstance(e, (str, int, float))][:3]
+            errs = doc.get("errors") if isinstance(doc.get("errors"), list) else []
+            warns = [str(e) for e in errs if isinstance(e, (str, int, float))][:3]
             out = "【respire · stored】Saved with warnings"
             if warns:
                 out += " (" + "; ".join(warns)[:160] + ")"
             out += f": {title} ({sid[:8]})."
         else:
             out = f"【respire · stored】Saved: {title} ({sid[:8]})."
-        rb = _readback(bin_path, sid, title, content)
+        rb = _readback(bin_path, sid, title, content, _budget_left(t0))
         if rb == "verified":
-            out += " Write verified by read-back (entry exists; title and content match)."
+            out += " Write verified by read-back (entry exists; id, title, and full content match)."
         elif rb == "mismatch":
             out += (f" Read-back shows a DIFFERENT title/content than sent — inspect rsrs show "
                     f"{sid[:8]} before any retitle.")
@@ -393,13 +423,15 @@ def do_store(bin_path: str, content: str, title: str = "", importance: str = "im
 
     # —— 未写入：pending 候选（含 pre-remember veto 等一切 pending 态）——
     if parse_ok and status == "pending":
+        items = doc.get("items") if isinstance(doc.get("items"), list) else []
         lines = ["【respire · store pending】respire judged this item similar to existing memory (or a hook vetoed it); "
                  "nothing was written. Candidates (read bodies with respire_show before deciding):"]
-        for it in (doc.get("items") or [])[:5]:
+        for it in items[:5]:
             if isinstance(it, dict):
                 act = f" — suggested: {it['action']}" if it.get("action") else ""
                 lines.append(f"- [{it.get('name', '?')}] {it.get('value', '')}{act}")
-        acts = [str(a) for a in (doc.get("actions") or []) if isinstance(a, str) and a.strip()][:6]
+        raw_acts = doc.get("actions") if isinstance(doc.get("actions"), list) else []
+        acts = [str(a) for a in raw_acts if isinstance(a, str) and a.strip()][:6]
         if acts:
             lines.append("Engine-suggested next actions (prefer merge > attach > new; decide from candidate bodies, never blind-force):")
             lines.extend(f"  {a}" for a in acts)
@@ -408,15 +440,26 @@ def do_store(bin_path: str, content: str, title: str = "", importance: str = "im
                          "or force=true only if genuinely independent.")
         return "\n".join(lines)
 
-    # —— 明确拒绝（可解析但非上述状态）——
-    if parse_ok and status:
-        errs = doc.get("errors") or []
-        msg = json.dumps(errs, ensure_ascii=False)[:200] if errs else f"status={status or r.returncode}"
+    # —— 引擎按当前模式拒绝执行（skip：readonly/paused 等；未写也不是失败）——
+    if parse_ok and status == "skip":
+        return ("【respire · not stored】The engine skipped the operation (read-only or paused mode); "
+                "never force a write.")
+
+    # —— 明确拒绝（白名单：仅 fail 断言 did not accept）——
+    if parse_ok and status == "fail":
+        errs = doc.get("errors") if isinstance(doc.get("errors"), list) else []
+        msg = json.dumps(errs, ensure_ascii=False)[:200] if errs else f"status=fail rc={r.returncode}"
         return f"【respire · store failed】respire did not accept it: {msg}"
 
-    # —— 结果未知：坏信封/无输出（engine 秒回，尚有预算）→ 先只读查库 ——
+    # —— 结果未知：陌生状态/缺 id/坏 summary/坏信封（engine 已回，尚有预算）→ 先只读查库 ——
     if r is not None:
-        hit = _verify_recent_write(bin_path, t0)
+        budget = _budget_left(t0)
+        hit = None
+        if budget >= 1.5:
+            try:
+                hit = _verify_recent_write(bin_path, t0, max_wait=budget)
+            except Exception:
+                hit = None
         if hit:
             hid, htitle = hit
             return ("【respire · store unknown】The write result is unknown (unreadable receipt), and a fresh entry "
@@ -539,7 +582,7 @@ class RespireMemoryProvider(MemoryProvider):
         self._probe = None          # (logged, total, probe_ok) 缓存
         self._probe_at = 0.0
         self._last_store_ts = None  # 引擎侧最近落库 epoch（后台刷）
-        self._prefix_stores = {}    # 显式「记：」幂等键：{(session,content-hash): 提交时刻}（HM-04）
+        self._prefix_stores = {}    # 显式「记：」幂等预占：{key: {"ts":…, "state":"in-flight|written|unknown"}}（HM-04）
         self._turns = 0
         self._threads = []
 
@@ -760,25 +803,47 @@ class RespireMemoryProvider(MemoryProvider):
                 if not engine:
                     return NO_RSRS
                 rest = q[m.end():].strip()
-                # HM-04 幂等：同一会话内同内容的显式快存只提交一次（prefetch 可能一触发多次）；
-                # 重复请求回执说明已提交过，绝不自动重发（重复写风险）
+                # HM-04 幂等预占（整改）：调用 do_store **前**在锁内一步完成「检查＋登记 in-flight」，
+                # 并发重复请求不可能同时通过检查；结果三态迁移：
+                #   written（ok/warn）→ 保持占用，重复触发回 already-submitted 回执；
+                #   unknown（超时/坏回执/缺 id）→ 保持占用，回执只允许只读核实、明令禁止重发；
+                #   pending/fail/skip（明确未写）→ 删除键，允许模型决断后再试。
+                # 30 分钟窗与 200 条上限保留。
                 key = hashlib.sha1((session_id or self._session_id or "").encode("utf-8", "replace")
                                    + b"\x00" + rest.strip().encode("utf-8", "replace")).hexdigest()
                 now = time.time()
                 with self._lock:
-                    seen = self._prefix_stores.get(key)
-                if seen and now - seen < 1800:
+                    prev = self._prefix_stores.get(key)
+                    if isinstance(prev, dict) and now - prev.get("ts", 0) < 1800:
+                        state = str(prev.get("state") or "")
+                    else:
+                        if len(self._prefix_stores) > 200:
+                            self._prefix_stores.clear()
+                        self._prefix_stores[key] = {"ts": now, "state": "in-flight"}  # 原子预占
+                        state = ""
+                if state == "in-flight":
+                    self._log("store", "prefix_inflight_skip", rest[:40])
+                    return ("【respire · store】The same store request is already in flight in this session; "
+                            "wait for its receipt — it was not sent again.")
+                if state == "written":
                     self._log("store", "prefix_dedup_skip", rest[:40])
                     return ("【respire · store】This exact content was already submitted in this session "
                             "(within the last 30 minutes) — it was not sent again. If this is a different fact, "
                             "rephrase it or add the distinguishing detail.")
+                if state == "unknown":
+                    self._log("store", "prefix_unknown_guard", rest[:40])
+                    return ("【respire · store】A previous attempt for this exact content returned an unknown result; "
+                            "verify read-only (rsrs list --limit 3 --json, then rsrs show <id>) and never resend "
+                            "respire_remember for the same fact — resending can duplicate an already-committed write.")
                 self._log("store", "prefix", rest[:40])
                 out = do_store(engine, rest)
-                if "【respire · stored】" in out:  # 仅已写入态（ok/warn）记幂等键；pending/unknown 不锁
-                    with self._lock:
-                        if len(self._prefix_stores) > 200:
-                            self._prefix_stores.clear()
-                        self._prefix_stores[key] = time.time()
+                with self._lock:
+                    if "【respire · stored】" in out:
+                        self._prefix_stores[key] = {"ts": now, "state": "written"}
+                    elif "【respire · store unknown】" in out:
+                        self._prefix_stores[key] = {"ts": now, "state": "unknown"}
+                    else:  # pending/fail/skip/空内容＝明确未写：解除占用，允许决断后再试
+                        self._prefix_stores.pop(key, None)
                 return out
             if len(q) < int(self._cfg.get("min_prompt_chars", 2)):
                 return None

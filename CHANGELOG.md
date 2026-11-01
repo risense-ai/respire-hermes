@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.3 — 复审整改：原子幂等预占＋回执/回读加固（PR #6 复核意见 #1/#2）
+
+### Fixed
+
+- **幂等预占原子化（意见 #1）**：「记：」prefetch 显式快存改为调用 `do_store` **前**在锁内一步完成「检查＋登记 in-flight」——并发重复请求不可能同时通过检查；结果三态迁移：`written`（ok/warn）保持占用、重复触发回 already-submitted 回执；`unknown`（超时/坏回执/缺 id）**保持占用**——重复 prefetch 只回「前次结果未知，只读核实（rsrs list/show），绝不重发」，杜绝已提交但回执丢失后的自动重发；`pending`/`fail`/`skip`（明确未写）删除键、允许模型决断后再试。30 分钟窗与 200 条上限保留。
+- **回执/回读加固（意见 #2）**：`summary` 字段类型防护＋id 白名单（`re.fullmatch(r"[0-9a-fA-F][0-9a-fA-F-]{7,}")`）——缺失/畸形 id 一律归 **unknown**（不再误入明确失败 `did not accept`）；明确拒绝收窄为白名单 **仅 `fail`**；新增 `skip` 分支（引擎按 readonly/paused 模式拒绝：未写也不是失败，文案「never force a write」）；其余陌生状态全归 unknown。写后回读改**全量核验**：`summary.id == 本条 id`、标题相等、完整正文相等（strip 规范化）——前 40 字相同不再宣称 verified；verified 文案如实标注 id/title/full content match。共享预算：remember 后剩余预算（`RESPITE_HOOK_BUDGET_S` 可覆盖，默认 20s−2.5s−已耗）<1.5s 时跳过回读与只读核实（unavailable），`_verify_recent_write` 受 `max_wait` 约束不再发预算外调用。
+
+### Changed
+
+- 版本 0.1.2 → 0.1.3（plugin.yaml 与 `__init__.py VERSION` 两处）。
+- 测试：provider 套件新增 31 项复审反例断言（并发原子预占只发一次、unknown 后重复 prefetch 零引擎调用、pending/skip/fail 键解除后再走引擎、缺 id/畸形 id/坏 summary 归 unknown、回读错 id 与前 40 字同尾部篡改判 mismatch、坏回读 unavailable 且保留 written 态、紧预算慢坏回执零追加调用；119 → 150，`--store` 探针 155）。桩 `store_stub` 扩展 10 种回执模式并把调用日志/回放状态改为实例私有文件。
+
 ## 0.1.2 — 审计整改：漏催修复＋写结果状态机＋幂等＋retitle 指引（HM-01~HM-05）
 
 ### Fixed
