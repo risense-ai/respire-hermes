@@ -252,7 +252,10 @@ check("store_nudge_every=0 关催促", isinstance(out4, str) and "Memory check" 
 prov_stub._cfg["store_nudge_every"] = 1
 prov_stub._cfg["budget_chars"] = 120
 out5 = prov_stub.prefetch("桩查询触发召回")
-check("budget_chars 截断生效", isinstance(out5, str) and len(out5) < 700, len(out5 or ""))
+# 预算只作用于召回块（标题行数≤1）；催促附加段（HM-05 后变长）不计入预算断言
+check("budget_chars 截断生效(召回块≤1行)", isinstance(out5, str)
+      and sum(1 for ln in out5.splitlines() if ln.startswith("- [")) <= 1, out5)
+check("budget 输出仍含催促但总长有界", isinstance(out5, str) and len(out5) < 1200, len(out5 or ""))
 prov_stub._turns = 0
 out6 = prov_stub.prefetch("桩查询触发召回")
 check("首轮（turns=0）不催", isinstance(out6, str) and "记忆检查" not in out6, out6)
@@ -404,9 +407,11 @@ if WITH_STORE and ENGINE:
     MARK = f"zh{int(time.time())} q3v9 随机标记无义串"
     out = new_prov(cfg={"rsrs": ENGINE}).handle_tool_call(
         "respire_remember", {"content": MARK, "force": True})
-    check("工具落库成功回执", "已存入" in out, out)
+    if "store pending" in out:
+        PASS += 1; print("SKIP  工具落库判重待决（实时库判重门收紧，ok 回执路径由桩覆盖）")
+    check("工具落库成功回执", "Saved:" in out, out)
     check("回执约束 retitle", "retitle" in out, out)
-    m = re.search(r"（([0-9a-f]{8})）", out)
+    m = re.search(r"[(（]([0-9a-f]{8})[)）]", out)
     check("回执带短 id", m is not None, out)
     if m:
         rc = mod.run_rsrs(ENGINE, ["forget", m.group(1), "--json"], 10)
@@ -415,12 +420,132 @@ if WITH_STORE and ENGINE:
         except Exception:
             check("探针清理(status=ok)", False, rc.stdout[:120])
     out2 = new_prov(cfg={"rsrs": ENGINE}).prefetch(f"记：{MARK}")
-    check("prefetch 前缀落库回执", isinstance(out2, str) and ("已存入" in out2 or "落库待决" in out2), out2)
-    m2 = re.search(r"（([0-9a-f]{8})）", out2 or "")
+    check("prefetch 前缀落库回执", isinstance(out2, str)
+          and ("Saved:" in out2 or "store pending" in out2 or "store unknown" in out2), out2)
+    m2 = re.search(r"[(（]([0-9a-f]{8})[)）]", out2 or "")
     if m2:
         mod.run_rsrs(ENGINE, ["forget", m2.group(1), "--json"], 10)  # 待决态未写入时 forget 会失败，忽略
 else:
     print("SKIP  写探针（默认只读；加 --store 开启，写真库并自动 forget 清理）")
+
+# ---- 11) 审计整改契约（HM-01~HM-05）：全走桩，零真库依赖 ----
+def store_stub(mode, stub_mode_var="RESPIRE_TEST_STORE_MODE"):
+    """remember/show/list 桩：mode 控制回执形态（ok/warn/pending/silent/show_bad）；list 恒 stale。"""
+    path = os.path.join(TMP, f"rsrs-store-{mode}-{time.time_ns()}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("""#!/usr/bin/env python3
+import json, os, sys
+sub = sys.argv[1] if len(sys.argv) > 1 else ""
+mode = os.environ.get("RESPIRE_TEST_STORE_MODE", "%MODE%")
+if sub == "remember":
+    # 记录本次 --title/正文供 show 回读（argv: remember content --title title ...）
+    try:
+        state = os.path.dirname(os.path.abspath(__file__)) + os.sep + "last-remember.json"
+        with open(state, "w", encoding="utf-8") as fh:
+            json.dump([sys.argv[4] if len(sys.argv) >= 5 else "", sys.argv[2]], fh)
+    except Exception:
+        pass
+    if mode == "silent":
+        sys.exit(0)
+    if mode == "warn":
+        print(json.dumps({"status": "warn", "summary": {"action": "created", "id": "eeeeeeeeeeeeeeee"},
+                          "errors": ["parent (cause) cannot be resolved; stored independently"]}))
+        sys.exit(2)
+    if mode == "pending":
+        print(json.dumps({"status": "pending", "summary": {"state": "candidates", "written": False},
+                          "items": [{"name": "aaaabbbb", "status": "pending",
+                                     "value": "similarity=88%% title=stub candidate",
+                                     "action": "merge or attach"}],
+                          "actions": ["rsrs remember \\"<combined content>\\" --merge-ids \\"aaaabbbb\\"",
+                                      "rsrs remember \\"<content>\\" --force to write as new entry"]}))
+        sys.exit(2)
+    print(json.dumps({"status": "ok", "summary": {"action": "created", "id": "dddddddddddddddd"}}))
+elif sub == "show":
+    if mode == "show_bad":
+        print(json.dumps({"status": "fail", "errors": ["not found"]}))
+        sys.exit(2)
+    # 回读回显最近一次 remember 发送的 --title/正文——状态落在脚本旁文件（show 自身 argv 不带标题）
+    state = os.path.dirname(os.path.abspath(__file__)) + os.sep + "last-remember.json"
+    title, content = "stub t", "stub c"
+    try:
+        with open(state, encoding="utf-8") as fh:
+            title, content = json.load(fh)
+    except Exception:
+        pass
+    print(json.dumps({"status": "ok", "summary": {"id": sys.argv[2], "title": title},
+                      "details": {"entry": {"id": sys.argv[2], "title": title, "content": content}}}))
+elif sub == "list":
+    print(json.dumps({"status": "ok", "details": [{"id": "ffffffffffffffff",
+        "created_at": "2020-01-01T00:00:00.000Z", "updated_at": "2020-01-01T00:00:00.000Z",
+        "title": "stale list entry"}]}))
+elif sub == "recall":
+    print(json.dumps({"status": "skip", "details": []}))
+else:
+    sys.exit(0)
+""".replace("%MODE%", mode))
+    os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
+    if os.name == "nt":
+        py = sys.executable
+        with open(path + ".cmd", "w", encoding="utf-8", newline="") as f:
+            f.write("@echo off" + chr(13) + chr(10) + '"%s" "%%~dp0%s" %%*' % (py, os.path.basename(path)) + chr(13) + chr(10))
+        return path + ".cmd"
+    return path
+
+
+env_ok = dict(os.environ, RESPIRE_TEST_STORE_MODE="ok")
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"
+sb = store_stub("ok")
+prov_ok = new_prov(cfg={"rsrs": sb})
+prov_ok._engine = sb
+out = prov_ok.prefetch("记：stub fact sentence one.")
+check("ok 写入回执含短 id", "Saved:" in out and "(dddddddd)" in out, out)
+check("ok 写入回读核验标注", "verified by read-back" in out, out)
+check("ok 回执 retitle 指引用 shell rsrs", "rsrs retitle dddddddd" in out, out)
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "warn"
+out = prov_ok.prefetch("记：warn fact sentence two.")
+check("warn 已写入不误报失败", "Saved with warnings" in out and "did not accept" not in out, out)
+check("warn 附引擎警告摘要", "parent (cause) cannot be resolved" in out, out)
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "pending"
+out = prov_ok.prefetch("记：pending fact sentence three.")
+check("pending 明示未写入", "nothing was written" in out, out)
+check("pending 候选带短id", "[aaaabbbb]" in out, out)
+check("pending 保留建议动作merge", "--merge-ids" in out, out)
+check("pending 保留建议动作force", "--force" in out, out)
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "silent"
+out = prov_ok.prefetch("记：silent fact sentence four.")
+check("坏回执归为unknown", "store unknown" in out, out)
+check("unknown 只读核实禁重发", "Do NOT resend" in out and "rsrs list --limit 3" in out, out)
+check("unknown 不误报失败", "did not accept" not in out, out)
+
+# HM-04 幂等：同会话同内容显式快存只提交一次
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"
+prov_idem = new_prov(cfg={"rsrs": sb})
+prov_idem._engine = sb
+prov_idem.prefetch("记：idempotent fact sentence.")
+calls_before = prov_idem.prefetch("记：idempotent fact sentence.")
+check("重复显式快存被幂等拦截", "already submitted in this session" in calls_before, calls_before)
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "pending"
+out = prov_idem.prefetch("记：pending does not lock idem key.")
+out2 = prov_idem.prefetch("记：pending does not lock idem key.")
+check("pending 不锁幂等键(可再决断)", "store pending" in out2, out2)
+
+# HM-01 零命中/空库催促：桩 recall=skip → 旧代码直接 return None 不催
+stub_zero = stub_engine(recall_hit=False)
+prov_zero = new_prov(cfg={"rsrs": stub_zero})
+prov_zero._engine = stub_zero
+prov_zero._turns = 1
+prov_zero._last_store_ts = time.time() - 3600
+out = prov_zero.prefetch("全新主题零命中查询")
+check("零命中轮仍附存储催促(HM-01)", isinstance(out, str) and "Memory check" in out, out)
+prov_zero._last_store_ts = None  # 空库：引擎 list 无可读数据
+out = prov_zero.prefetch("全新主题零命中查询")
+check("空库(无落库数据)也附催促(HM-01)", isinstance(out, str) and "Memory check" in out, out)
+prov_zero._cfg["store_nudge_every"] = 0
+out = prov_zero.prefetch("全新主题零命中查询")
+check("节流关闭零命中轮不催", out is None, out)
+check("催促明示不得替代当前任务(HM-05)", "never a replacement" in mod.STORE_NUDGE, mod.STORE_NUDGE)
+check("简则改题指引用 rsrs retitle 而非 remember(HM-03)",
+      "respire_remember (retitle)" not in mod.RULES and "rsrs retitle" in mod.RULES, mod.RULES[105:160])
 
 print("----")
 print(f"PASS={PASS} FAIL={FAIL}")

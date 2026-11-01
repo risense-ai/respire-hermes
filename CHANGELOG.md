@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.2 — 审计整改：漏催修复＋写结果状态机＋幂等＋retitle 指引（HM-01~HM-05）
+
+### Fixed
+
+- **HM-01 催促漏触发**：催促判定移出「召回命中」分支——零命中/新主题轮同样催；空库（`_last_store_ts=None`）同样视为近窗无落库（旧代码两处都静默漏催）。
+- **HM-02 写结果状态机**：`warn`+有效 id = **已写入带警告**（不误报失败、不引导重发）；超时/坏回执归为 **unknown**——回执只允许只读核实（`rsrs list`/`rsrs show`）并明令禁止重发（旧文案「手动 rsrs remember 核实」有重复写风险）；ok/warn 后 `show` 写后回读核验（verified/mismatch/unavailable 如实标注）；pending 保留候选短 id 与引擎建议动作全量（改＞并＞挂＞存，§7.2）。
+- **HM-03 retitle 指引纠正**：简则不再指示用 `respire_remember (retitle)` 改题（工具无此动作）——改为 shell `rsrs retitle <short-id> --title`，并明示不得靠新存复制改题。
+- **HM-04 显式快存幂等**：同会话同内容的「记：」prefetch 只提交一次（30 分钟窗），重复触发回执说明已提交、绝不自动重发；pending/unknown 不锁键（仍可决断）。
+- **HM-05 催促不吞任务**：STORE_NUDGE 明示「当前任务的附加项，先完成用户请求再做检查，绝不替代/推迟当前任务」。
+
+### Changed
+
+- 测试：provider 套件新增 22 项契约断言（状态机各态、幂等、零命中/空库催促、HM-03/05 文本契约；99 → 119）；--store 探针修正过时中文回执断言（英文化遗留）并兼容半/全角括号（124/0）。`RESPIRE_TEST_STORE_MODE` 桩模式经 sidecar 白名单环境注入。
+
+## 0.1.1 (2026-10-31)
 ## 0.1.1 (2026-10-31)
 
 - 模型可见文本全量英文化（dimcode 0.5.6 同款）：`RULES` / `NO_RSRS` / `LOGIN_NUDGE` / `EMPTY_NUDGE` / `NO_MODEL` / `PROBE_FAIL` / `STORE_NUDGE`、`format_recall` 召回头行、`do_store` 落库回执（stored / store pending / store failed）、`do_show` 条目块（entry / causal·upstream / causal·downstream）全部改英文；「记：」等中文前缀兼容不变。
