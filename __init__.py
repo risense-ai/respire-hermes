@@ -27,7 +27,7 @@ import threading
 import time
 from pathlib import Path
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 PROVIDER_NAME = "respire"
 
 logger = logging.getLogger("hermes.plugins.respire")
@@ -302,8 +302,11 @@ def _budget_left(t0: float) -> float:
 
 
 def _readback(bin_path: str, sid: str, title: str, content: str, budget_s: float = SHOW_T):
-    """写后核验（R11）：show 回读，**全量核验**——返回条目 summary.id==本条 id、标题相等、
-    完整正文相等（strip 规范化）；任一不符即 mismatch，绝不部分核验宣称 verified。
+    """写后核验（R11）：show 回读，**全量核验**——summary.id、entry.id 与本条 id 三方一致
+    （都为原生字符串且完全相等）、标题相等、完整正文相等（strip 规范化）；任一不符即
+    mismatch，绝不部分核验宣称 verified。title/content 必须原生字符串后比对
+    （数字/数组/对象不强转匹配：输入 "42" 不匹配回读数字 42）。坏回读只如实标注
+    mismatch/unavailable，不撤销 Saved 已写事实、不引导重写。
     剩余共享预算 <1.5s 直接 unavailable（不发起核实调用，防预算外追加引擎调用）。"""
     if budget_s < 1.5:
         return "unavailable"
@@ -320,11 +323,20 @@ def _readback(bin_path: str, sid: str, title: str, content: str, budget_s: float
     if not isinstance(entry, dict):
         return "unavailable"
     summ = doc.get("summary")
-    rid = str(summ.get("id") or "") if isinstance(summ, dict) else ""
-    if rid != sid:  # 返回的是别的条目：不是本条核验通过
-        logger.warning("readback mismatch sid=%s rid=%s %.0fms", sid[:8], rid[:8], (time.time() - t0) * 1000)
+    rid_raw = summ.get("id") if isinstance(summ, dict) else None
+    eid_raw = entry.get("id")
+    # 三方一致（0.1.5 复审三轮）：summary.id、entry.id 都必须原生字符串且等于目标 id——
+    # entry.id 错误/缺失 = 回读到别的/无名条目 → mismatch，不算本条核验通过。
+    if not (isinstance(rid_raw, str) and rid_raw == sid and isinstance(eid_raw, str) and eid_raw == sid):
+        logger.warning("readback mismatch sid=%s rid=%r eid=%r %.0fms",
+                       sid[:8], rid_raw, eid_raw, (time.time() - t0) * 1000)
         return "mismatch"
-    et, ec = str(entry.get("title") or ""), str(entry.get("content") or "")
+    et_raw, ec_raw = entry.get("title"), entry.get("content")
+    if not isinstance(et_raw, str) or not isinstance(ec_raw, str):
+        logger.warning("readback mismatch sid=%s non-native title/content types %.0fms",
+                       sid[:8], (time.time() - t0) * 1000)
+        return "mismatch"  # 数字/数组/对象正文不强转匹配（42 ≠ "42"）
+    et, ec = et_raw, ec_raw
     bad_title = bool(title) and et != title
     bad_body = content.strip() != ec.strip()  # 完整正文比对（去首尾空白规范化）——前缀相同不算
     if bad_title or bad_body:
@@ -370,10 +382,11 @@ def do_store(bin_path: str, content: str, title: str = "", importance: str = "im
       pending → 未写入：转述候选（items 带短 id）＋引擎建议动作（改＞并＞挂＞存）
       skip    → 引擎按当前模式拒绝（readonly/paused 等）：未写也不是失败，绝不引导强写
       fail    → 唯一明确拒绝态（白名单）：转述 errors，断言 did not accept
-      其余一切（陌生状态/缺 id/畸形 id/坏 summary/坏信封/超时）→ 结果 unknown：
+      其余一切（陌生状态/缺 id/非字符串 id/畸形 id/坏 summary/坏信封/超时）→ 结果 unknown：
       回执只允许只读核实（list/show）并明令禁止重发；剩余共享预算不足时连核实调用也省。
-    summary 字段类型防护＋id 白名单（十六进制连字至少 8 位）：缺/畸形 id 一律按不可确认处理，
-    不当有效、也不当失败。返回回执文本，绝不抛异常。"""
+    summary 字段类型防护＋严格 id 白名单（0.1.5 复审三轮）：id 必须原生字符串（JSON 数字不强转）
+    且匹配完整 UUID 或 16+ 位规范 hex——缺/畸形 id 一律按不可确认处理，不当有效、也不当失败。
+    返回回执文本，绝不抛异常。"""
     if not content:
         return "【respire · store】Content is empty; nothing was stored."
     title = (title or "").strip() or extract_title(content) or "respire quick store"
@@ -400,9 +413,12 @@ def do_store(bin_path: str, content: str, title: str = "", importance: str = "im
         doc = {}
     status = str(doc.get("status") or "")
     summ = doc.get("summary")
-    sid = str(summ.get("id") or "") if isinstance(summ, dict) else ""  # 非 dict summary 防护
-    if not re.fullmatch(r"[0-9a-fA-F][0-9a-fA-F-]{7,}", sid):
-        sid = ""  # 缺失/畸形 id：不可确认，不当有效也不当失败
+    raw_id = summ.get("id") if isinstance(summ, dict) else None
+    # 严格 id 白名单（0.1.5 复审三轮）：先检查原始类型为字符串（JSON 数字 12345678 绝不 str() 强转），
+    # 再校验真实 CLI ID 格式（完整 UUID 或 16+ 位规范 hex；横线畸形串如 a------- 拒绝）。
+    # 缺失/非字符串/畸形 id 一律归 unknown：不可确认，不当有效、也不当失败。
+    sid = raw_id if isinstance(raw_id, str) and re.fullmatch(
+        r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{16,}", raw_id, re.I) else ""
 
     # —— 已写入：ok / warn（warn 也是已提交，只是带警告）——
     if parse_ok and sid and status in ("ok", "warn"):

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.5 — 复审三轮整改：严格原生字符串 id 白名单＋回读三方一致/原生类型（PR #6 复核 P2）
+
+### Fixed
+
+- **严格 id 白名单（复核 P2 意见#1）**：`do_store` 不再 `str(summary.id)` 强转＋宽松 `[0-9a-fA-F][0-9a-fA-F-]{7,}` 校验——改为先检查原始类型为字符串（JSON 数字 `12345678` 绝不强转），再以完整 UUID 或 16+ 位规范 hex 双形态 `re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{16,}", …, re.I)` 校验真实 CLI ID 格式（横线畸形串 `a-------` 拒绝）。ok/warn 的缺失/非字符串/畸形 id 一律归 **unknown**（只读核实、禁重发），不再进入 Saved 分支向用户错误承诺已写；「记：」幂等键相应保持 unknown、绝不迁 written。
+- **回读三方一致＋原生类型（复核 P2 意见#2）**：`_readback` 不再只核 `summary.id`、不再 `str()` 强转标题/正文——`summary.id`、`entry.id` 与目标 id **三方均为原生字符串且完全一致**（entry.id 错误/缺失 → mismatch，绝不 verified）；`title`/`content` 必须 `isinstance(str)` 后再比对（回读 JSON 数字 `42` 不匹配输入字符串 `"42"`）。坏回读保留 Saved 已写事实，输出如实标注 mismatch/unavailable，绝不称 verified、不引导重写。
+
+### Changed
+
+- 版本 0.1.4 → 0.1.5（plugin.yaml 与 `__init__.py VERSION` 两处）。
+- 测试：provider 套件新增 20 项复审三轮反例断言（178 → 198）：ok/warn＋JSON 数字 id、ok＋横线畸形 id → unknown 回执＋幂等键不迁 written＋重复 prefetch 零重发（unknown 键仍保护）；回读 entry.id 错误（`DIFFERENT`）/缺失 → mismatch 不 verified；回读数字正文 42 vs 输入 `"42"` → mismatch；合法 UUID 正向对照仍 verified。桩 `store_stub` 新增 7 种回执/回读模式（ok_numid/warn_numid/ok_dashid/ok_uuid/show_eid_diff/show_eid_missing/show_num_content）。
+
 ## 0.1.4 — 复审二轮整改：容量清理/TTL 不撤销 unknown/in-flight 保护（PR #6 复核 P2）
 
 ### Fixed

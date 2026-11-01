@@ -433,8 +433,9 @@ else:
 # ---- 11) 审计整改契约（HM-01~HM-05）：全走桩，零真库依赖 ----
 def store_stub(mode, stub_mode_var="RESPIRE_TEST_STORE_MODE"):
     """remember/show/list 桩：mode 控制回执形态（0.1.3 扩展：silent/slow_ok/slow_garbage/
-    ok_noid/ok_badid/bad_summary/skip/fail/ok_rid/ok_tamper/show_bad）；list 恒 stale；
-    每次调用追加记入脚本旁 <stub>.calls（按实例隔离，供幂等/预算测试断言引擎调用数）。"""
+    ok_noid/ok_badid/bad_summary/skip/fail/ok_rid/ok_tamper/show_bad；0.1.5 复审三轮扩展：
+    ok_numid/warn_numid/ok_dashid/ok_uuid/show_eid_diff/show_eid_missing/show_num_content）；
+    list 恒 stale；每次调用追加记入脚本旁 <stub>.calls（按实例隔离，供幂等/预算测试断言引擎调用数）。"""
     path = os.path.join(TMP, f"rsrs-store-{mode}-{time.time_ns()}")
     calls_log = (path + ".calls").replace("\\", "/")   # 烤进脚本的实例私有调用日志
     state_json = (path + ".state").replace("\\", "/")  # 实例私有的 remember title/content 回放状态
@@ -471,6 +472,20 @@ if sub == "remember":
         sys.exit(0)
     if mode == "ok_badid":
         print(json.dumps({"status": "ok", "summary": {"action": "created", "id": "zz!!short"}}))
+        sys.exit(0)
+    if mode == "ok_numid":  # id 为 JSON 数字（旧代码 str() 强转＋宽松正则误收进 Saved）
+        print(json.dumps({"status": "ok", "summary": {"action": "created", "id": 12345678}}))
+        sys.exit(0)
+    if mode == "warn_numid":  # warn＋JSON 数字 id：同为不可确认回执
+        print(json.dumps({"status": "warn", "summary": {"action": "created", "id": 12345678},
+                          "errors": ["parent (cause) cannot be resolved; stored independently"]}))
+        sys.exit(2)
+    if mode == "ok_dashid":  # 横线畸形串（旧宽松正则 [0-9a-fA-F][0-9a-fA-F-]{7,} 误收）
+        print(json.dumps({"status": "ok", "summary": {"action": "created", "id": "a-------"}}))
+        sys.exit(0)
+    if mode == "ok_uuid":  # 完整 UUID：新白名单合法形态（正向对照）
+        print(json.dumps({"status": "ok", "summary": {"action": "created",
+                          "id": "123e4567-e89b-12d3-a456-426614174000"}}))
         sys.exit(0)
     if mode == "bad_summary":
         print(json.dumps({"status": "ok", "summary": ["not", "a", "dict"], "details": "also not a dict"}))
@@ -510,6 +525,18 @@ elif sub == "show":
         rid = "1111111111111111"  # 回读返回别的条目 id（entry 内容却回显正确——专检 summary.id 核对）
     if mode == "ok_tamper" and len(content) > 40:
         content = content[:40] + " tampered tail"  # 前 40 字相同、尾部篡改（旧代码会误报 verified）
+    if mode == "show_eid_diff":  # summary.id 正确、entry.id 却是别的字符串（旧代码只核 summary.id → 假 verified）
+        print(json.dumps({"status": "ok", "summary": {"id": rid, "title": title},
+                          "details": {"entry": {"id": "DIFFERENT", "title": title, "content": content}}}))
+        sys.exit(0)
+    if mode == "show_eid_missing":  # entry 整体缺 id 键 → 三方不一致（回读到无名条目）
+        print(json.dumps({"status": "ok", "summary": {"id": rid, "title": title},
+                          "details": {"entry": {"title": title, "content": content}}}))
+        sys.exit(0)
+    if mode == "show_num_content":  # 正文回读为 JSON 数字 42（输入正文是字符串 "42"）→ 42 ≠ "42"
+        print(json.dumps({"status": "ok", "summary": {"id": rid, "title": title},
+                          "details": {"entry": {"id": rid, "title": title, "content": 42}}}))
+        sys.exit(0)
     print(json.dumps({"status": "ok", "summary": {"id": rid, "title": title},
                       "details": {"entry": {"id": rid, "title": title, "content": content}}}))
 elif sub == "list":
@@ -837,6 +864,65 @@ try:
 finally:
     mod._PREFIX_STORE_CAP = _CAP_SAVED
     mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"
+
+
+# ---- 11d) 复审三轮（0.1.5，PR #6 复核 P2）：严格原生字符串 id 白名单＋回读三方一致/原生类型 ----
+# 意见#1：id 必须原生字符串且匹配真实 CLI ID 格式（完整 UUID 或 16+ 位 hex）——
+# JSON 数字 12345678（ok/warn）、横线畸形串 a------- 都不再是有效写回执：
+# 归 unknown（只读核实、禁重发）、幂等键不迁 written、重复 prefetch 零重发。
+for _mode, _desc in (("ok_numid", "ok+数字 id"), ("warn_numid", "warn+数字 id"), ("ok_dashid", "ok+横线畸形 id")):
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = _mode
+    sb_n = store_stub(_mode)
+    prov_n = new_prov(cfg={"rsrs": sb_n})
+    prov_n._engine = sb_n
+    out_n = prov_n.prefetch("记：strict id whitelist unknown fact sentence.")
+    check(f"{_desc} 归 unknown(复审三轮#1)", isinstance(out_n, str) and "store unknown" in out_n
+          and "Do NOT resend" in out_n, out_n)
+    check(f"{_desc} 不误报已写入/明确失败", "Saved" not in (out_n or "") and "did not accept" not in (out_n or ""), out_n)
+    check(f"{_desc} 幂等键不迁 written(保持 unknown)",
+          prov_n._prefix_stores.get(_pkey("strict id whitelist unknown fact sentence."), {}).get("state") == "unknown",
+          prov_n._prefix_stores)
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"   # 引擎恢复健康，诱惑重发
+    _before_n = stub_calls(sb_n).count("remember")
+    out_n2 = prov_n.prefetch("记：strict id whitelist unknown fact sentence.")
+    check(f"{_desc} 重复 prefetch 不重发 remember(unknown 键仍保护)", isinstance(out_n2, str)
+          and "returned an unknown result" in out_n2
+          and stub_calls(sb_n).count("remember") == _before_n, out_n2)
+
+# 意见#2：回读三方一致——summary.id 正确但 entry.id 错误/缺失 → mismatch，绝不 verified
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "show_eid_diff"
+sb_e = store_stub("show_eid_diff")
+prov_e = new_prov(cfg={"rsrs": sb_e})
+prov_e._engine = sb_e
+out_e = prov_e.prefetch("记：entry id differs fact sentence beyond forty characters.")
+check("回读 entry.id 错误判 mismatch(复审三轮#2)", "Saved:" in out_e and "DIFFERENT title/content" in out_e, out_e)
+check("entry.id 错误不称 verified", "verified by read-back" not in out_e, out_e)
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "show_eid_missing"
+sb_m = store_stub("show_eid_missing")
+prov_m = new_prov(cfg={"rsrs": sb_m})
+prov_m._engine = sb_m
+out_m = prov_m.prefetch("记：entry id missing fact sentence beyond forty characters.")
+check("回读 entry.id 缺失判 mismatch", "Saved:" in out_m and "DIFFERENT title/content" in out_m, out_m)
+check("entry.id 缺失不称 verified", "verified by read-back" not in out_m, out_m)
+
+# 意见#2：原生类型——输入正文 "42"、回读 JSON 数字 42 → 不强转匹配 → mismatch
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "show_num_content"
+sb_c = store_stub("show_num_content")
+prov_c = new_prov(cfg={"rsrs": sb_c})
+prov_c._engine = sb_c
+out_c = prov_c.prefetch("记：42")
+check('回读数字正文 42 不匹配输入 "42" 判 mismatch', "Saved:" in out_c and "DIFFERENT title/content" in out_c, out_c)
+check("数字正文不称 verified", "verified by read-back" not in out_c, out_c)
+
+# 正向对照：合法 UUID（新白名单形态）→ 全量回读核验仍 verified
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok_uuid"
+sb_v = store_stub("ok_uuid")
+prov_v = new_prov(cfg={"rsrs": sb_v})
+prov_v._engine = sb_v
+out_v = prov_v.prefetch("记：valid uuid positive control fact sentence.")
+check("合法 UUID 白名单正向仍 verified", "Saved:" in out_v and "verified by read-back" in out_v, out_v)
+check("UUID 回执短 id 取前 8 位", "(123e4567)" in out_v, out_v)
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"
 
 
 # HM-01 零命中/空库催促：桩 recall=skip → 旧代码直接 return None 不催
