@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import re
@@ -15,6 +16,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
 import time
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -252,7 +254,10 @@ check("store_nudge_every=0 关催促", isinstance(out4, str) and "Memory check" 
 prov_stub._cfg["store_nudge_every"] = 1
 prov_stub._cfg["budget_chars"] = 120
 out5 = prov_stub.prefetch("桩查询触发召回")
-check("budget_chars 截断生效", isinstance(out5, str) and len(out5) < 700, len(out5 or ""))
+# 预算只作用于召回块（标题行数≤1）；催促附加段（HM-05 后变长）不计入预算断言
+check("budget_chars 截断生效(召回块≤1行)", isinstance(out5, str)
+      and sum(1 for ln in out5.splitlines() if ln.startswith("- [")) <= 1, out5)
+check("budget 输出仍含催促但总长有界", isinstance(out5, str) and len(out5) < 1200, len(out5 or ""))
 prov_stub._turns = 0
 out6 = prov_stub.prefetch("桩查询触发召回")
 check("首轮（turns=0）不催", isinstance(out6, str) and "记忆检查" not in out6, out6)
@@ -404,9 +409,11 @@ if WITH_STORE and ENGINE:
     MARK = f"zh{int(time.time())} q3v9 随机标记无义串"
     out = new_prov(cfg={"rsrs": ENGINE}).handle_tool_call(
         "respire_remember", {"content": MARK, "force": True})
-    check("工具落库成功回执", "已存入" in out, out)
+    if "store pending" in out:
+        PASS += 1; print("SKIP  工具落库判重待决（实时库判重门收紧，ok 回执路径由桩覆盖）")
+    check("工具落库成功回执", "Saved:" in out, out)
     check("回执约束 retitle", "retitle" in out, out)
-    m = re.search(r"（([0-9a-f]{8})）", out)
+    m = re.search(r"[(（]([0-9a-f]{8})[)）]", out)
     check("回执带短 id", m is not None, out)
     if m:
         rc = mod.run_rsrs(ENGINE, ["forget", m.group(1), "--json"], 10)
@@ -415,12 +422,526 @@ if WITH_STORE and ENGINE:
         except Exception:
             check("探针清理(status=ok)", False, rc.stdout[:120])
     out2 = new_prov(cfg={"rsrs": ENGINE}).prefetch(f"记：{MARK}")
-    check("prefetch 前缀落库回执", isinstance(out2, str) and ("已存入" in out2 or "落库待决" in out2), out2)
-    m2 = re.search(r"（([0-9a-f]{8})）", out2 or "")
+    check("prefetch 前缀落库回执", isinstance(out2, str)
+          and ("Saved:" in out2 or "store pending" in out2 or "store unknown" in out2), out2)
+    m2 = re.search(r"[(（]([0-9a-f]{8})[)）]", out2 or "")
     if m2:
         mod.run_rsrs(ENGINE, ["forget", m2.group(1), "--json"], 10)  # 待决态未写入时 forget 会失败，忽略
 else:
     print("SKIP  写探针（默认只读；加 --store 开启，写真库并自动 forget 清理）")
+
+# ---- 11) 审计整改契约（HM-01~HM-05）：全走桩，零真库依赖 ----
+def store_stub(mode, stub_mode_var="RESPIRE_TEST_STORE_MODE"):
+    """remember/show/list 桩：mode 控制回执形态（0.1.3 扩展：silent/slow_ok/slow_garbage/
+    ok_noid/ok_badid/bad_summary/skip/fail/ok_rid/ok_tamper/show_bad；0.1.5 复审三轮扩展：
+    ok_numid/warn_numid/ok_dashid/ok_uuid/show_eid_diff/show_eid_missing/show_num_content）；
+    list 恒 stale；每次调用追加记入脚本旁 <stub>.calls（按实例隔离，供幂等/预算测试断言引擎调用数）。"""
+    path = os.path.join(TMP, f"rsrs-store-{mode}-{time.time_ns()}")
+    calls_log = (path + ".calls").replace("\\", "/")   # 烤进脚本的实例私有调用日志
+    state_json = (path + ".state").replace("\\", "/")  # 实例私有的 remember title/content 回放状态
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("""#!/usr/bin/env python3
+import json, os, sys, time
+sub = sys.argv[1] if len(sys.argv) > 1 else ""
+mode = os.environ.get("RESPIRE_TEST_STORE_MODE", "%MODE%")
+CALLS, STATE = "%CALLS%", "%STATE%"
+try:
+    with open(CALLS, "a", encoding="utf-8") as c:
+        c.write(sub + chr(10))
+except Exception:
+    pass
+if sub == "remember":
+    # 记录本次 --title/正文供 show 回读（argv: remember content --title title ...）
+    try:
+        with open(STATE, "w", encoding="utf-8") as fh:
+            json.dump([sys.argv[4] if len(sys.argv) >= 5 else "", sys.argv[2]], fh)
+    except Exception:
+        pass
+    if mode == "silent":
+        sys.exit(0)
+    if mode == "slow_garbage":
+        time.sleep(2.5)
+        print("not-json-garbage {{{")
+        sys.exit(0)
+    if mode == "slow_ok":
+        time.sleep(1.2)
+        print(json.dumps({"status": "ok", "summary": {"action": "created", "id": "dddddddddddddddd"}}))
+        sys.exit(0)
+    if mode == "ok_noid":
+        print(json.dumps({"status": "ok", "summary": {"action": "created", "written": True}}))
+        sys.exit(0)
+    if mode == "ok_badid":
+        print(json.dumps({"status": "ok", "summary": {"action": "created", "id": "zz!!short"}}))
+        sys.exit(0)
+    if mode == "ok_numid":  # id 为 JSON 数字（旧代码 str() 强转＋宽松正则误收进 Saved）
+        print(json.dumps({"status": "ok", "summary": {"action": "created", "id": 12345678}}))
+        sys.exit(0)
+    if mode == "warn_numid":  # warn＋JSON 数字 id：同为不可确认回执
+        print(json.dumps({"status": "warn", "summary": {"action": "created", "id": 12345678},
+                          "errors": ["parent (cause) cannot be resolved; stored independently"]}))
+        sys.exit(2)
+    if mode == "ok_dashid":  # 横线畸形串（旧宽松正则 [0-9a-fA-F][0-9a-fA-F-]{7,} 误收）
+        print(json.dumps({"status": "ok", "summary": {"action": "created", "id": "a-------"}}))
+        sys.exit(0)
+    if mode == "ok_uuid":  # 完整 UUID：新白名单合法形态（正向对照）
+        print(json.dumps({"status": "ok", "summary": {"action": "created",
+                          "id": "123e4567-e89b-12d3-a456-426614174000"}}))
+        sys.exit(0)
+    if mode == "bad_summary":
+        print(json.dumps({"status": "ok", "summary": ["not", "a", "dict"], "details": "also not a dict"}))
+        sys.exit(0)
+    if mode == "skip":
+        print(json.dumps({"status": "skip", "summary": {"state": "readonly", "written": False}}))
+        sys.exit(2)
+    if mode == "fail":
+        print(json.dumps({"status": "fail", "errors": ["importance must be important or trivial"]}))
+        sys.exit(2)
+    if mode == "warn":
+        print(json.dumps({"status": "warn", "summary": {"action": "created", "id": "eeeeeeeeeeeeeeee"},
+                          "errors": ["parent (cause) cannot be resolved; stored independently"]}))
+        sys.exit(2)
+    if mode == "pending":
+        print(json.dumps({"status": "pending", "summary": {"state": "candidates", "written": False},
+                          "items": [{"name": "aaaabbbb", "status": "pending",
+                                     "value": "similarity=88%% title=stub candidate",
+                                     "action": "merge or attach"}],
+                          "actions": ["rsrs remember \\"<combined content>\\" --merge-ids \\"aaaabbbb\\"",
+                                      "rsrs remember \\"<content>\\" --force to write as new entry"]}))
+        sys.exit(2)
+    print(json.dumps({"status": "ok", "summary": {"action": "created", "id": "dddddddddddddddd"}}))
+elif sub == "show":
+    if mode == "show_bad":
+        print(json.dumps({"status": "fail", "errors": ["not found"]}))
+        sys.exit(2)
+    # 回读回显最近一次 remember 发送的 --title/正文——状态落在实例私有文件（show 自身 argv 不带标题）
+    title, content = "stub t", "stub c"
+    try:
+        with open(STATE, encoding="utf-8") as fh:
+            title, content = json.load(fh)
+    except Exception:
+        pass
+    rid = sys.argv[2]
+    if mode == "ok_rid":
+        rid = "1111111111111111"  # 回读返回别的条目 id（entry 内容却回显正确——专检 summary.id 核对）
+    if mode == "ok_tamper" and len(content) > 40:
+        content = content[:40] + " tampered tail"  # 前 40 字相同、尾部篡改（旧代码会误报 verified）
+    if mode == "show_eid_diff":  # summary.id 正确、entry.id 却是别的字符串（旧代码只核 summary.id → 假 verified）
+        print(json.dumps({"status": "ok", "summary": {"id": rid, "title": title},
+                          "details": {"entry": {"id": "DIFFERENT", "title": title, "content": content}}}))
+        sys.exit(0)
+    if mode == "show_eid_missing":  # entry 整体缺 id 键 → 三方不一致（回读到无名条目）
+        print(json.dumps({"status": "ok", "summary": {"id": rid, "title": title},
+                          "details": {"entry": {"title": title, "content": content}}}))
+        sys.exit(0)
+    if mode == "show_num_content":  # 正文回读为 JSON 数字 42（输入正文是字符串 "42"）→ 42 ≠ "42"
+        print(json.dumps({"status": "ok", "summary": {"id": rid, "title": title},
+                          "details": {"entry": {"id": rid, "title": title, "content": 42}}}))
+        sys.exit(0)
+    print(json.dumps({"status": "ok", "summary": {"id": rid, "title": title},
+                      "details": {"entry": {"id": rid, "title": title, "content": content}}}))
+elif sub == "list":
+    print(json.dumps({"status": "ok", "details": [{"id": "ffffffffffffffff",
+        "created_at": "2020-01-01T00:00:00.000Z", "updated_at": "2020-01-01T00:00:00.000Z",
+        "title": "stale list entry"}]}))
+elif sub == "recall":
+    print(json.dumps({"status": "skip", "details": []}))
+else:
+    sys.exit(0)
+""".replace("%MODE%", mode).replace("%CALLS%", calls_log).replace("%STATE%", state_json))
+    os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
+    if os.name == "nt":
+        py = sys.executable
+        with open(path + ".cmd", "w", encoding="utf-8", newline="") as f:
+            f.write("@echo off" + chr(13) + chr(10) + '"%s" "%%~dp0%s" %%*' % (py, os.path.basename(path)) + chr(13) + chr(10))
+        return path + ".cmd"
+    return path
+
+
+def stub_calls(engine):
+    """读桩引擎实例私有的 <stub>.calls（store_stub 每次调用记一行子命令名）。"""
+    base = engine[:-4] if engine.endswith(".cmd") else engine
+    log = base + ".calls"
+    if not os.path.exists(log):
+        return []
+    with open(log, encoding="utf-8") as f:
+        return [l for l in f.read().splitlines() if l.strip()]
+
+
+env_ok = dict(os.environ, RESPIRE_TEST_STORE_MODE="ok")
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"
+sb = store_stub("ok")
+prov_ok = new_prov(cfg={"rsrs": sb})
+prov_ok._engine = sb
+out = prov_ok.prefetch("记：stub fact sentence one.")
+check("ok 写入回执含短 id", "Saved:" in out and "(dddddddd)" in out, out)
+check("ok 写入回读核验标注", "verified by read-back" in out, out)
+check("ok 回执 retitle 指引用 shell rsrs", "rsrs retitle dddddddd" in out, out)
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "warn"
+out = prov_ok.prefetch("记：warn fact sentence two.")
+check("warn 已写入不误报失败", "Saved with warnings" in out and "did not accept" not in out, out)
+check("warn 附引擎警告摘要", "parent (cause) cannot be resolved" in out, out)
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "pending"
+out = prov_ok.prefetch("记：pending fact sentence three.")
+check("pending 明示未写入", "nothing was written" in out, out)
+check("pending 候选带短id", "[aaaabbbb]" in out, out)
+check("pending 保留建议动作merge", "--merge-ids" in out, out)
+check("pending 保留建议动作force", "--force" in out, out)
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "silent"
+out = prov_ok.prefetch("记：silent fact sentence four.")
+check("坏回执归为unknown", "store unknown" in out, out)
+check("unknown 只读核实禁重发", "Do NOT resend" in out and "rsrs list --limit 3" in out, out)
+check("unknown 不误报失败", "did not accept" not in out, out)
+
+# HM-04 幂等：同会话同内容显式快存只提交一次
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"
+prov_idem = new_prov(cfg={"rsrs": sb})
+prov_idem._engine = sb
+prov_idem.prefetch("记：idempotent fact sentence.")
+calls_before = prov_idem.prefetch("记：idempotent fact sentence.")
+check("重复显式快存被幂等拦截", "already submitted in this session" in calls_before, calls_before)
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "pending"
+out = prov_idem.prefetch("记：pending does not lock idem key.")
+_before_pend = stub_calls(sb).count("remember")
+out2 = prov_idem.prefetch("记：pending does not lock idem key.")
+check("pending 不锁幂等键(可再决断)", "store pending" in out2, out2)
+check("pending 重试确实再走引擎(键已解除)", stub_calls(sb).count("remember") == _before_pend + 1,
+      stub_calls(sb))
+
+# ---- 11b) 复审整改契约（0.1.3，PR #6 复核意见 #1/#2）：原子幂等预占三态＋回执/回读加固 ----
+# 并发原子预占（意见#1）：两线程同时 prefetch 同内容——锁内「检查＋登记 in-flight」一步完成，
+# 仅一个线程能发起 do_store（slow_ok 桩 remember 睡 1.2s 拉开窗口），另一线程回 in-flight 等待回执
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "slow_ok"
+sb_cc = store_stub("slow_ok")
+prov_cc = new_prov(cfg={"rsrs": sb_cc})
+prov_cc._engine = sb_cc
+_cc_results = []
+
+
+def _cc_prefetch():
+    _cc_results.append(prov_cc.prefetch("记：concurrent in-flight fact sentence."))
+
+
+_cc_threads = [threading.Thread(target=_cc_prefetch) for _ in range(2)]
+for _t in _cc_threads:
+    _t.start()
+for _t in _cc_threads:
+    _t.join()
+_cc_calls = stub_calls(sb_cc)
+check("并发预占只发一次 remember(意见#1)", _cc_calls.count("remember") == 1, _cc_calls)
+check("并发一方收到已写入回执", any(isinstance(o, str) and "Saved:" in o for o in _cc_results), _cc_results)
+check("并发另一方回 in-flight 等待", any(isinstance(o, str) and "already in flight in this session" in o
+                                       for o in _cc_results), _cc_results)
+check("in-flight 回执明示等待不重发", any(isinstance(o, str) and "wait for its receipt" in o
+                                        for o in _cc_results), _cc_results)
+
+# unknown 三态（意见#1）：已提交但回执丢失 → 键保持 unknown，重复 prefetch 只读核实、绝不自动重发
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "silent"
+sb_u = store_stub("silent")
+prov_u = new_prov(cfg={"rsrs": sb_u})
+prov_u._engine = sb_u
+out_u = prov_u.prefetch("记：lost receipt unknown fact sentence.")
+check("已提交但回执丢失归 unknown", isinstance(out_u, str) and "store unknown" in out_u, out_u)
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"   # 引擎恢复健康，诱惑重发
+_before_u = stub_calls(sb_u).count("remember")
+out_u2 = prov_u.prefetch("记：lost receipt unknown fact sentence.")
+check("unknown 后重复 prefetch 回只读核实回执", isinstance(out_u2, str)
+      and "returned an unknown result" in out_u2 and "never resend" in out_u2, out_u2)
+check("unknown 后重复 prefetch 不再调 do_store", stub_calls(sb_u).count("remember") == _before_u,
+      stub_calls(sb_u))
+check("unknown 保持占用不误报已写", "already submitted" not in (out_u2 or ""), out_u2)
+
+# 回执加固（意见#2）：缺 id / 畸形 id / 坏 summary → unknown（不误报明确失败、不抛异常丢回执）
+for _mode, _desc in (("ok_noid", "缺 id"), ("ok_badid", "畸形 id"), ("bad_summary", "坏 summary")):
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = _mode
+    prov_x = new_prov(cfg={"rsrs": sb})
+    prov_x._engine = sb
+    out_x = prov_x.prefetch(f"记：{_mode} unknown classification fact sentence.")
+    check(f"{_desc} 归 unknown(意见#2)", isinstance(out_x, str) and "store unknown" in out_x, out_x)
+    check(f"{_desc} 不误报明确失败", "did not accept" not in (out_x or ""), out_x)
+
+# skip 新分支（意见#2）：引擎按 readonly/paused 模式拒绝——未写也不是失败、绝不引导强写、不锁键
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "skip"
+prov_sk = new_prov(cfg={"rsrs": sb})
+prov_sk._engine = sb
+out_sk = prov_sk.prefetch("记：skip mode rejection fact sentence.")
+check("skip 回引擎模式拒绝(新分支)", "not stored" in out_sk and "read-only or paused mode" in out_sk, out_sk)
+check("skip 回执禁强写", "never force a write" in out_sk, out_sk)
+check("skip 未写不算失败也不算未知", "did not accept" not in out_sk and "store unknown" not in out_sk, out_sk)
+out_sk2 = prov_sk.prefetch("记：skip mode rejection fact sentence.")
+check("skip 不锁键(重复触发仍走引擎)", "not stored" in out_sk2, out_sk2)
+
+# fail 白名单（意见#2）：唯一明确拒绝态；不锁键（模型可修参后重试）
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "fail"
+out_fl = prov_sk.prefetch("记：fail mode rejection fact sentence.")
+check("fail 白名单明确拒绝", "did not accept" in out_fl and "importance must be" in out_fl, out_fl)
+out_fl2 = prov_sk.prefetch("记：fail mode rejection fact sentence.")
+check("fail 不锁键(可修参重试)", "did not accept" in out_fl2, out_fl2)
+
+# 全量回读核验（意见#2）：错 id / 前 40 字同但尾部篡改 → mismatch，绝不称 verified
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok_rid"
+out_rid = prov_sk.prefetch("记：readback wrong id fact sentence beyond forty characters.")
+check("回读错 id 判 mismatch", "Saved:" in out_rid and "DIFFERENT title/content" in out_rid, out_rid)
+check("错 id 不称 verified", "verified by read-back" not in out_rid, out_rid)
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok_tamper"
+out_tp = prov_sk.prefetch("记：readback tamper fact sentence with tail beyond forty characters.")
+check("前40字同但尾部篡改判 mismatch", "Saved:" in out_tp and "DIFFERENT title/content" in out_tp, out_tp)
+check("尾部篡改不称 verified(旧代码必漏)", "verified by read-back" not in out_tp, out_tp)
+
+# 坏回读（意见#2）：show 失败 → unavailable 如实标注；已写回执与 written 幂等态保留
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "show_bad"
+out_sb2 = prov_sk.prefetch("记：show bad readback unavailable fact sentence.")
+check("坏回读如实标 unavailable", "Saved:" in out_sb2 and "Read-back unavailable" in out_sb2, out_sb2)
+check("坏回读不误报 mismatch", "DIFFERENT title/content" not in out_sb2, out_sb2)
+out_sb3 = prov_sk.prefetch("记：show bad readback unavailable fact sentence.")
+check("回读失败保留已写回执(键仍 written)", "already submitted in this session" in out_sb3, out_sb3)
+
+# 共享预算（意见#2）：紧预算+慢坏回执 → unknown，且预算外零追加引擎调用（不查库不回读）
+os.environ["RESPITE_HOOK_BUDGET_S"] = "4"
+try:
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "slow_garbage"
+    sb_b = store_stub("slow_garbage")
+    prov_b = new_prov(cfg={"rsrs": sb_b})
+    prov_b._engine = sb_b
+    out_b = prov_b.prefetch("记：tight budget slow garbage receipt.")
+    _calls_b = stub_calls(sb_b)
+    check("紧预算+慢坏回执归 unknown", isinstance(out_b, str) and "store unknown" in out_b, out_b)
+    check("紧预算零追加引擎调用(意见#2)", _calls_b.count("remember") == 1
+          and "list" not in _calls_b and "show" not in _calls_b, _calls_b)
+    out_b2 = prov_b.prefetch("记：tight budget slow garbage receipt.")
+    check("紧预算 unknown 后重复触发不重发", "returned an unknown result" in out_b2
+          and stub_calls(sb_b).count("remember") == 1, out_b2)
+finally:
+    os.environ.pop("RESPITE_HOOK_BUDGET_S", None)
+    mod.os.environ.pop("RESPITE_HOOK_BUDGET_S", None)
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"
+
+
+# ---- 11c) 复审二轮（0.1.4，PR #6 复核 P2）：容量清理/TTL 不得撤销 unknown/in-flight 保护 ----
+# 容量上限覆写为小值（模块常量 mod._PREFIX_STORE_CAP，避免真造 200 键）；TTL 用真值 1800s，
+# 直接改 _prefix_stores 内部 ts 模拟「远超 1800s」（复审建议的 mtime/时钟注入等价手法）。
+def _pkey(content):
+    """与 provider 同口径计算「记：」幂等键（session 固定 selftest；rest=去前缀内容）。"""
+    return hashlib.sha1(b"selftest" + b"\x00" + content.strip().encode("utf-8", "replace")).hexdigest()
+
+
+_CAP_SAVED = mod._PREFIX_STORE_CAP
+try:
+    mod._PREFIX_STORE_CAP = 3
+
+    # ① unknown A ＋ 超容个未决键 ＋ 再次 A → A 仍只读核实、绝无第二次 remember
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "silent"
+    sb_cap = store_stub("silent")
+    prov_cap = new_prov(cfg={"rsrs": sb_cap})
+    prov_cap._engine = sb_cap
+    out_a1 = prov_cap.prefetch("记：capacity unknown protected fact A.")
+    check("① unknown A 首发归 unknown", isinstance(out_a1, str) and "store unknown" in out_a1, out_a1)
+    for _fill in ("capacity unresolved filler one.", "capacity unresolved filler two.",
+                  "capacity unresolved filler three."):
+        prov_cap.prefetch(f"记：{_fill}")            # 各自 unknown 占位 → 表内含 A 共 4 个未决
+    out_fill4 = prov_cap.prefetch("记：capacity unresolved filler four.")  # len=4>3 → 淘汰路径
+    _states_cap = sorted(str(v.get("state")) for v in prov_cap._prefix_stores.values())
+    check("① 超容被未决项占满（旧代码此处已 clear 全清）", _states_cap == ["unknown"] * 4, _states_cap)
+    check("① 未决项占满时保守拒绝新自动提交", isinstance(out_fill4, str)
+          and "saturated with unresolved outcomes" in out_fill4
+          and "store manually via rsrs" in out_fill4 and "verify read-only" in out_fill4, out_fill4)
+    _sat2 = prov_cap.prefetch("记：capacity saturated stays bounded fact.")
+    check("① 保守拒绝后表规模有界不增长", isinstance(_sat2, str) and "saturated with unresolved outcomes" in _sat2
+          and len(prov_cap._prefix_stores) <= 4, len(prov_cap._prefix_stores))
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"    # 引擎恢复健康，诱惑重发
+    _before_a = stub_calls(sb_cap).count("remember")
+    out_a2 = prov_cap.prefetch("记：capacity unknown protected fact A.")
+    check("① unknown A 经容量清理后仍拒重发", isinstance(out_a2, str)
+          and "returned an unknown result" in out_a2 and "never resend" in out_a2, out_a2)
+    check("① unknown A 绝无第二次 remember", stub_calls(sb_cap).count("remember") == _before_a,
+          stub_calls(sb_cap))
+
+    # ② in-flight A ＋ 容量清理（filler 触发淘汰路径）＋ 并发 A → 仍无第二次 remember
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "silent"
+    sb_if = store_stub("silent")
+    prov_if = new_prov(cfg={"rsrs": sb_if})
+    prov_if._engine = sb_if
+    prov_if.prefetch("记：inflight filler one.")         # unknown 占位
+    prov_if.prefetch("记：inflight filler two.")         # unknown 占位
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "slow_garbage"  # B 的 remember 睡 2.5s：可观测 in-flight 窗
+    _if_first = {}
+
+    def _if_store():
+        _if_first["out"] = prov_if.prefetch("记：inflight capacity protected fact B.")
+
+    _t_if = threading.Thread(target=_if_store)
+    _t_if.start()
+    _dl = time.time() + 10
+    while stub_calls(sb_if).count("remember") < 3 and time.time() < _dl:
+        time.sleep(0.05)    # 等 B 的 remember 进桩（进程起跑即记账）——此刻 B 必已锁内登记 in-flight
+    check("② B 已在桩内 in-flight（remember 已记账）", stub_calls(sb_if).count("remember") >= 3,
+          stub_calls(sb_if))
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "silent"
+    prov_if.prefetch("记：inflight filler three.")       # len 3→4（unknown）
+    out_if_c = prov_if.prefetch("记：inflight filler four.")    # len=4>3 → 淘汰路径跑过、B 不得被删
+    check("② 容量清理不动 in-flight（保守拒绝而非腾位重发）", isinstance(out_if_c, str)
+          and "saturated with unresolved outcomes" in out_if_c, out_if_c)
+    _st_b = prov_if._prefix_stores.get(_pkey("inflight capacity protected fact B."), {}).get("state")
+    check("② B 经容量清理后仍在表内（in-flight/unknown）", _st_b in ("in-flight", "unknown"),
+          prov_if._prefix_stores)
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"    # 引擎恢复健康，诱惑重发
+    _if_retry = []
+
+    def _if_retry_store():
+        _if_retry.append(prov_if.prefetch("记：inflight capacity protected fact B."))
+
+    _trs = [threading.Thread(target=_if_retry_store) for _ in range(2)]
+    for _t in _trs:
+        _t.start()
+    for _t in _trs:
+        _t.join()
+    _t_if.join()
+    check("② 并发重复 B 全部走保护回执、无一重发", all(isinstance(o, str) and ("already in flight" in o
+          or "returned an unknown result" in o or "already submitted" in o) and "Saved:" not in o
+          for o in _if_retry), _if_retry)
+    check("② in-flight 全程绝无第二次 remember（filler1/2+B+filler3=4 次）",
+          stub_calls(sb_if).count("remember") == 4, stub_calls(sb_if))
+    check("② B 首发垃圾回执归 unknown", isinstance(_if_first.get("out"), str)
+          and "store unknown" in _if_first["out"], _if_first)
+    out_if_b2 = prov_if.prefetch("记：inflight capacity protected fact B.")
+    check("② B 终态 unknown 仍拒重发", isinstance(out_if_b2, str) and "returned an unknown result" in out_if_b2
+          and stub_calls(sb_if).count("remember") == 4, out_if_b2)
+
+    # ③ 「过期 unknown」路径不存在：unknown 无 TTL——远超 1800s 后重复 prefetch 仍拒重发；
+    #    对照 written 过期（>TTL）= 安全终态、允许再存（TTL 语义仅作用于 written）
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "silent"
+    sb_ttl = store_stub("silent")
+    prov_ttl = new_prov(cfg={"rsrs": sb_ttl})
+    prov_ttl._engine = sb_ttl
+    prov_ttl.prefetch("记：ttl unknown never expires fact.")
+    _k_u = next(iter(prov_ttl._prefix_stores))
+    prov_ttl._prefix_stores[_k_u]["ts"] = time.time() - (mod._PREFIX_STORE_TTL + 7200)  # 远超 TTL
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"
+    _before_t = stub_calls(sb_ttl).count("remember")
+    out_t2 = prov_ttl.prefetch("记：ttl unknown never expires fact.")
+    check("③ unknown 远超 1800s 仍拒重发（无过期路径）", isinstance(out_t2, str)
+          and "returned an unknown result" in out_t2 and "never resend" in out_t2, out_t2)
+    check("③ unknown 远超 TTL 零重发调用", stub_calls(sb_ttl).count("remember") == _before_t,
+          stub_calls(sb_ttl))
+    prov_ttl.prefetch("记：ttl written expires restorable fact.")      # ok 模式 → written
+    _k_ws = [k for k, v in prov_ttl._prefix_stores.items() if str(v.get("state")) == "written"]
+    check("③ 对照 written 登记在册", len(_k_ws) == 1, prov_ttl._prefix_stores)
+    prov_ttl._prefix_stores[_k_ws[0]]["ts"] = time.time() - (mod._PREFIX_STORE_TTL + 7200)
+    _before_w = stub_calls(sb_ttl).count("remember")
+    out_t3 = prov_ttl.prefetch("记：ttl written expires restorable fact.")
+    check("③ 对照 written 过期后允许再存（安全终态）", isinstance(out_t3, str) and "Saved:" in out_t3, out_t3)
+    check("③ 对照 written 过期再存确走引擎", stub_calls(sb_ttl).count("remember") == _before_w + 1,
+          stub_calls(sb_ttl))
+
+    # ④ 容量淘汰只清安全终态 written：先清过期、再按最旧淘汰其余 written；unknown 存活、新键可入
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"
+    sb_ev = store_stub("ok")
+    prov_ev = new_prov(cfg={"rsrs": sb_ev})
+    prov_ev._engine = sb_ev
+    prov_ev.prefetch("记：evict written oldest fact one.")             # written（最旧）
+    prov_ev.prefetch("记：evict written second fact two.")             # written
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "silent"
+    prov_ev.prefetch("记：evict unknown keeper fact three.")           # unknown（不可淘汰）
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"
+    out_ev4 = prov_ev.prefetch("记：evict newcomer fact four.")        # len 3→4（3 不> 3，不触发淘汰）
+    check("④ 未超容前新键可入（不淘汰）", isinstance(out_ev4, str) and "Saved:" in out_ev4, out_ev4)
+    out_ev5 = prov_ev.prefetch("记：evict after oldest fact five.")    # len=4>3 → 淘汰最旧 written#1 让位
+    check("④ 超容淘汰最旧 written 后新键可存", isinstance(out_ev5, str) and "Saved:" in out_ev5, out_ev5)
+    check("④ 最旧 written 被淘汰", _pkey("evict written oldest fact one.") not in prov_ev._prefix_stores,
+          sorted(prov_ev._prefix_stores))
+    check("④ 较新 written 保留", _pkey("evict written second fact two.") in prov_ev._prefix_stores,
+          sorted(prov_ev._prefix_stores))
+    check("④ unknown 在容量压力下存活", prov_ev._prefix_stores.get(
+        _pkey("evict unknown keeper fact three."), {}).get("state") == "unknown", prov_ev._prefix_stores)
+    check("④ 淘汰后表规模有界（≤cap+1）", len(prov_ev._prefix_stores) <= 4, len(prov_ev._prefix_stores))
+    prov_ev._prefix_stores[_pkey("evict newcomer fact four.")]["ts"] = time.time() - (mod._PREFIX_STORE_TTL + 60)
+    out_ev6 = prov_ev.prefetch("记：evict expired first fact six.")    # 过期 written 优先被清、让位成功
+    check("④ 过期 written 优先淘汰后仍有位", isinstance(out_ev6, str) and "Saved:" in out_ev6, out_ev6)
+    check("④ 过期 written 已被清理", _pkey("evict newcomer fact four.") not in prov_ev._prefix_stores,
+          sorted(prov_ev._prefix_stores))
+    check("④ 未过期 written 不误删", _pkey("evict after oldest fact five.") in prov_ev._prefix_stores,
+          sorted(prov_ev._prefix_stores))
+    check("④ 全程 6 次 remember、零保守拒绝", stub_calls(sb_ev).count("remember") == 6, stub_calls(sb_ev))
+finally:
+    mod._PREFIX_STORE_CAP = _CAP_SAVED
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"
+
+
+# ---- 11d) 复审三轮（0.1.5，PR #6 复核 P2）：严格原生字符串 id 白名单＋回读三方一致/原生类型 ----
+# 意见#1：id 必须原生字符串且匹配真实 CLI ID 格式（完整 UUID 或 16+ 位 hex）——
+# JSON 数字 12345678（ok/warn）、横线畸形串 a------- 都不再是有效写回执：
+# 归 unknown（只读核实、禁重发）、幂等键不迁 written、重复 prefetch 零重发。
+for _mode, _desc in (("ok_numid", "ok+数字 id"), ("warn_numid", "warn+数字 id"), ("ok_dashid", "ok+横线畸形 id")):
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = _mode
+    sb_n = store_stub(_mode)
+    prov_n = new_prov(cfg={"rsrs": sb_n})
+    prov_n._engine = sb_n
+    out_n = prov_n.prefetch("记：strict id whitelist unknown fact sentence.")
+    check(f"{_desc} 归 unknown(复审三轮#1)", isinstance(out_n, str) and "store unknown" in out_n
+          and "Do NOT resend" in out_n, out_n)
+    check(f"{_desc} 不误报已写入/明确失败", "Saved" not in (out_n or "") and "did not accept" not in (out_n or ""), out_n)
+    check(f"{_desc} 幂等键不迁 written(保持 unknown)",
+          prov_n._prefix_stores.get(_pkey("strict id whitelist unknown fact sentence."), {}).get("state") == "unknown",
+          prov_n._prefix_stores)
+    mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"   # 引擎恢复健康，诱惑重发
+    _before_n = stub_calls(sb_n).count("remember")
+    out_n2 = prov_n.prefetch("记：strict id whitelist unknown fact sentence.")
+    check(f"{_desc} 重复 prefetch 不重发 remember(unknown 键仍保护)", isinstance(out_n2, str)
+          and "returned an unknown result" in out_n2
+          and stub_calls(sb_n).count("remember") == _before_n, out_n2)
+
+# 意见#2：回读三方一致——summary.id 正确但 entry.id 错误/缺失 → mismatch，绝不 verified
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "show_eid_diff"
+sb_e = store_stub("show_eid_diff")
+prov_e = new_prov(cfg={"rsrs": sb_e})
+prov_e._engine = sb_e
+out_e = prov_e.prefetch("记：entry id differs fact sentence beyond forty characters.")
+check("回读 entry.id 错误判 mismatch(复审三轮#2)", "Saved:" in out_e and "DIFFERENT title/content" in out_e, out_e)
+check("entry.id 错误不称 verified", "verified by read-back" not in out_e, out_e)
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "show_eid_missing"
+sb_m = store_stub("show_eid_missing")
+prov_m = new_prov(cfg={"rsrs": sb_m})
+prov_m._engine = sb_m
+out_m = prov_m.prefetch("记：entry id missing fact sentence beyond forty characters.")
+check("回读 entry.id 缺失判 mismatch", "Saved:" in out_m and "DIFFERENT title/content" in out_m, out_m)
+check("entry.id 缺失不称 verified", "verified by read-back" not in out_m, out_m)
+
+# 意见#2：原生类型——输入正文 "42"、回读 JSON 数字 42 → 不强转匹配 → mismatch
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "show_num_content"
+sb_c = store_stub("show_num_content")
+prov_c = new_prov(cfg={"rsrs": sb_c})
+prov_c._engine = sb_c
+out_c = prov_c.prefetch("记：42")
+check('回读数字正文 42 不匹配输入 "42" 判 mismatch', "Saved:" in out_c and "DIFFERENT title/content" in out_c, out_c)
+check("数字正文不称 verified", "verified by read-back" not in out_c, out_c)
+
+# 正向对照：合法 UUID（新白名单形态）→ 全量回读核验仍 verified
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok_uuid"
+sb_v = store_stub("ok_uuid")
+prov_v = new_prov(cfg={"rsrs": sb_v})
+prov_v._engine = sb_v
+out_v = prov_v.prefetch("记：valid uuid positive control fact sentence.")
+check("合法 UUID 白名单正向仍 verified", "Saved:" in out_v and "verified by read-back" in out_v, out_v)
+check("UUID 回执短 id 取前 8 位", "(123e4567)" in out_v, out_v)
+mod.os.environ["RESPIRE_TEST_STORE_MODE"] = "ok"
+
+
+# HM-01 零命中/空库催促：桩 recall=skip → 旧代码直接 return None 不催
+stub_zero = stub_engine(recall_hit=False)
+prov_zero = new_prov(cfg={"rsrs": stub_zero})
+prov_zero._engine = stub_zero
+prov_zero._turns = 1
+prov_zero._last_store_ts = time.time() - 3600
+out = prov_zero.prefetch("全新主题零命中查询")
+check("零命中轮仍附存储催促(HM-01)", isinstance(out, str) and "Memory check" in out, out)
+prov_zero._last_store_ts = None  # 空库：引擎 list 无可读数据
+out = prov_zero.prefetch("全新主题零命中查询")
+check("空库(无落库数据)也附催促(HM-01)", isinstance(out, str) and "Memory check" in out, out)
+prov_zero._cfg["store_nudge_every"] = 0
+out = prov_zero.prefetch("全新主题零命中查询")
+check("节流关闭零命中轮不催", out is None, out)
+check("催促明示不得替代当前任务(HM-05)", "never a replacement" in mod.STORE_NUDGE, mod.STORE_NUDGE)
+check("简则改题指引用 rsrs retitle 而非 remember(HM-03)",
+      "respire_remember (retitle)" not in mod.RULES and "rsrs retitle" in mod.RULES, mod.RULES[105:160])
 
 print("----")
 print(f"PASS={PASS} FAIL={FAIL}")

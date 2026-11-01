@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -26,7 +27,7 @@ import threading
 import time
 from pathlib import Path
 
-VERSION = "0.1.1"
+VERSION = "0.1.5"
 PROVIDER_NAME = "respire"
 
 logger = logging.getLogger("hermes.plugins.respire")
@@ -66,6 +67,13 @@ STORE_T = 18
 LIST_T = 30   # 「近窗落库」检查窗口（1.0.16 冷启动实测可达 27s；热态约 0.3–0.9s）
 LOG_MAX = 256 * 1024  # plugin.log 超此整文件清轮
 
+# 「记：」幂等表（_prefix_stores）容量/TTL（0.1.4 复审二轮，模块常量便于测试覆写）：
+#   容量超 _PREFIX_STORE_CAP 只淘汰安全终态 written（先 TTL 已过期、再 ts 最旧）；
+#   in-flight/unknown 永不淘汰、永不因 TTL 失效——未知/未决结果的防重发保护绝不因容量或过期撤销；
+#   淘汰后仍超容（被未决项占满）→ 保守拒绝新的自动提交（无界内存不增长、保护不破坏）。
+_PREFIX_STORE_CAP = 200
+_PREFIX_STORE_TTL = 1800  # 仅作用于 written：过期=可安全再存（unknown/in-flight 无 TTL）
+
 DEFAULTS = {
     "rsrs": "",                 # respire 引擎（rsrs）路径；空 = 自动探测（向导字段 rsrs_path 落此键）
     "recall_threshold": 0.0,    # 召回下限，0=默认关（rsrs 直出）：skip 门管无关、limit 限流、标题档廉价
@@ -102,7 +110,7 @@ SECRET_SKIP = ("【respire · skipped】The input looks like it contains a crede
 
 RULES = """【respire memory layer · attached】This session is backed by the local respire (rsrs) memory store; data is encrypted locally and synced to the cloud (account registration and login are outside this layer, see rsrs.rs).
 1. Recall before answering: the respire_recall tool (or shell rsrs recall "project name + keywords" --json --titles); on errors or anomalies, recall using the original error text first.
-2. Store when wrapping up: respire_remember (judge first, store immediately: similar items return candidates, decide before sending; title is the facade for recall and dedup — a complete "subject + action + result" fact sentence); when the message starts with "记：" this layer stores it first as a fallback — if the receipt includes a provisional title and short id, **extract a more precise fact sentence and replace the title with respire_remember (retitle)**.
+2. Store when wrapping up: respire_remember (judge first, store immediately: similar items return candidates, decide before sending; title is the facade for recall and dedup — a complete "subject + action + result" fact sentence); when the message starts with "记：" this layer stores it first as a fallback — if the receipt includes a provisional title and short id, **extract a more precise fact sentence and fix the title with the shell command `rsrs retitle <short-id> --title "…"` (respire_remember only stores new entries — it cannot retitle; never re-store a new copy just to change the title)**.
 3. Automatic recall is injected with the system prompt each turn; if no injection is present, the hits are off-topic, or the topic involves an earlier project, error, agreement, or date, recall again with different wording before answering (try synonyms, hypernyms, and English equivalents, one route each); do not repeat only when the injected hits are truly relevant. Prefix /nomem to disable automatic recall for this turn.
 4. Read full bodies with respire_show (first 8 chars of the id); dig the causal chain with rsrs chain.
 5. Never put passwords, ID numbers, phone numbers, card numbers, or private keys into memory bodies or query terms — record only where they are stored. The library is encrypted, but a leaked key exposes everything.
@@ -126,7 +134,8 @@ STORE_NUDGE = ("Memory check (automatic, once): do only one thing — if this tu
                "agreements, lessons, or pitfalls, store them one by one with respire_remember (--importance important; "
                "titles as \"subject + action + result\" fact sentences; on dedup candidates, decide to attach with parent "
                "or force the write first); if this turn was just Q&A or chat with no new facts, end directly and do not "
-               "repeat the answer.")
+               "repeat the answer. This is an addendum to the current task, never a replacement: finish the user's "
+               "request first, then run this check — do not let it substitute for or postpone the current task.")
 
 _REDACT = [
     (re.compile(r"(?i)(password|passwd|pwd|密码|口令)\s*[:=：]\s*\S+"), r"\1=[REDACTED]"),
@@ -279,9 +288,105 @@ def do_recall(bin_path: str, query: str, limit: int, threshold: float, budget: i
     return text
 
 
+SHOW_T = 8    # 写后回读（show）窗口
+
+
+def _budget_left(t0: float) -> float:
+    """remember 后剩余共享预算（秒）：总窗 RESPITE_HOOK_BUDGET_S 可覆盖（默认 20s）－2.5s 呼吸保留－已耗。
+    环境变量解析失败按默认窗，绝不抛异常（回执丢失比预算保守更糟）。"""
+    try:
+        total = float(os.environ.get("RESPITE_HOOK_BUDGET_S") or 20)
+    except Exception:
+        total = 20.0
+    return total - 2.5 - (time.time() - t0)
+
+
+def _readback(bin_path: str, sid: str, title: str, content: str, budget_s: float = SHOW_T):
+    """写后核验（R11）：show 回读，**全量核验**——summary.id、entry.id 与本条 id 三方一致
+    （都为原生字符串且完全相等）、标题相等、完整正文相等（strip 规范化）；任一不符即
+    mismatch，绝不部分核验宣称 verified。title/content 必须原生字符串后比对
+    （数字/数组/对象不强转匹配：输入 "42" 不匹配回读数字 42）。坏回读只如实标注
+    mismatch/unavailable，不撤销 Saved 已写事实、不引导重写。
+    剩余共享预算 <1.5s 直接 unavailable（不发起核实调用，防预算外追加引擎调用）。"""
+    if budget_s < 1.5:
+        return "unavailable"
+    t0 = time.time()
+    try:
+        r = run_rsrs(bin_path, ["show", sid, "--json"], min(SHOW_T, max(2, int(budget_s))))
+        doc = json.loads(r.stdout) if r.stdout else {}
+    except Exception:
+        return "unavailable"
+    if not isinstance(doc, dict) or doc.get("status") != "ok":
+        return "unavailable"
+    det = doc.get("details")
+    entry = det.get("entry") if isinstance(det, dict) else None
+    if not isinstance(entry, dict):
+        return "unavailable"
+    summ = doc.get("summary")
+    rid_raw = summ.get("id") if isinstance(summ, dict) else None
+    eid_raw = entry.get("id")
+    # 三方一致（0.1.5 复审三轮）：summary.id、entry.id 都必须原生字符串且等于目标 id——
+    # entry.id 错误/缺失 = 回读到别的/无名条目 → mismatch，不算本条核验通过。
+    if not (isinstance(rid_raw, str) and rid_raw == sid and isinstance(eid_raw, str) and eid_raw == sid):
+        logger.warning("readback mismatch sid=%s rid=%r eid=%r %.0fms",
+                       sid[:8], rid_raw, eid_raw, (time.time() - t0) * 1000)
+        return "mismatch"
+    et_raw, ec_raw = entry.get("title"), entry.get("content")
+    if not isinstance(et_raw, str) or not isinstance(ec_raw, str):
+        logger.warning("readback mismatch sid=%s non-native title/content types %.0fms",
+                       sid[:8], (time.time() - t0) * 1000)
+        return "mismatch"  # 数字/数组/对象正文不强转匹配（42 ≠ "42"）
+    et, ec = et_raw, ec_raw
+    bad_title = bool(title) and et != title
+    bad_body = content.strip() != ec.strip()  # 完整正文比对（去首尾空白规范化）——前缀相同不算
+    if bad_title or bad_body:
+        logger.warning("readback mismatch sid=%s title=%s body=%s %.0fms",
+                       sid[:8], bad_title, bad_body, (time.time() - t0) * 1000)
+        return "mismatch"
+    return "verified"
+
+
+def _verify_recent_write(bin_path: str, t0: float, max_wait: float = 0):
+    """未知写结果的只读核实（R10）：list 近 3 条里是否有 t0 之后落库的条目。返回 (id, title) 或 None。
+    max_wait>0 时受剩余共享预算约束（超时上限取 min(LIST_T, max_wait)），预算外不发核实调用。"""
+    try:
+        timeout = LIST_T
+        if max_wait > 0:
+            timeout = max(1, min(LIST_T, int(max_wait)))
+        r = run_rsrs(bin_path, ["list", "--limit", "3", "--json"], timeout)
+        doc = json.loads(r.stdout) if r.stdout else None
+    except Exception:
+        return None
+    if not isinstance(doc, dict) or doc.get("status") != "ok":
+        return None
+    best, best_ts = None, None
+    for d in (doc.get("details") or []):
+        if not isinstance(d, dict):
+            continue
+        ts = None
+        for k in ("updated_at", "created_at"):
+            v = _epoch(d.get(k))
+            if v is not None and (ts is None or v > ts):
+                ts = v
+        if ts is not None and (best_ts is None or ts > best_ts):
+            best, best_ts = d, ts
+    if best is None or best_ts is None or best_ts < t0 - 0.05:  # 引擎毫秒截断容差
+        return None
+    return str(best.get("id") or ""), str(best.get("title") or "")
+
+
 def do_store(bin_path: str, content: str, title: str = "", importance: str = "important",
              parent: str = "", force: bool = False):
-    """判后即存三态——ok 直写 / pending 给候选待决 / 其余为失败；返回回执文本，绝不抛异常。"""
+    """写回执状态机（对齐 CLI 信封语义，审计报告 §7.1/§7.2）：
+      ok/warn + 有效 summary.id → 已写入：show 全量回读核验后回执（verified/mismatch/unavailable 如实标注）
+      pending → 未写入：转述候选（items 带短 id）＋引擎建议动作（改＞并＞挂＞存）
+      skip    → 引擎按当前模式拒绝（readonly/paused 等）：未写也不是失败，绝不引导强写
+      fail    → 唯一明确拒绝态（白名单）：转述 errors，断言 did not accept
+      其余一切（陌生状态/缺 id/非字符串 id/畸形 id/坏 summary/坏信封/超时）→ 结果 unknown：
+      回执只允许只读核实（list/show）并明令禁止重发；剩余共享预算不足时连核实调用也省。
+    summary 字段类型防护＋严格 id 白名单（0.1.5 复审三轮）：id 必须原生字符串（JSON 数字不强转）
+    且匹配完整 UUID 或 16+ 位规范 hex——缺/畸形 id 一律按不可确认处理，不当有效、也不当失败。
+    返回回执文本，绝不抛异常。"""
     if not content:
         return "【respire · store】Content is empty; nothing was stored."
     title = (title or "").strip() or extract_title(content) or "respire quick store"
@@ -291,34 +396,105 @@ def do_store(bin_path: str, content: str, title: str = "", importance: str = "im
         args += ["--parent", parent]
     if force:
         args += ["--force"]
+    t0 = time.time()
+    r = None
     try:
         r = run_rsrs(bin_path, args, STORE_T)
     except Exception as e:
-        return f"【respire · store】respire timed out ({type(e).__name__}); run rsrs remember manually to verify whether it was written."
-    try:
-        doc = json.loads(r.stdout) if r.stdout else {}
-    except Exception:
-        doc = {}
+        logger.warning("store timeout/error: %s", e)
+    doc, parse_ok = {}, False
+    if r is not None and r.stdout and r.stdout.strip():
+        try:
+            doc = json.loads(r.stdout)
+            parse_ok = True
+        except Exception:
+            doc, parse_ok = {}, False
     if not isinstance(doc, dict):
         doc = {}
     status = str(doc.get("status") or "")
-    if status == "ok":
-        sid = str((doc.get("summary") or {}).get("id") or "")
-        tail = f" ({sid[:8]})" if sid else ""
-        return (f"【respire · stored】Saved: {title}{tail}. The title is a rule-based provisional one — "
-                "extract a complete \"subject + action + result\" fact sentence from the content and "
-                f"replace it with rsrs retitle {sid[:8]} --title (title is the facade for recall and dedup).")
-    if status == "pending":
-        # 判后即存判定疑似重复/可挂靠，未写入（written:false）——转述候选，模型接续决断
-        lines = ["【respire · store pending】respire judged this item similar to existing memory; nothing was written. Candidates:"]
-        for it in (doc.get("items") or [])[:5]:
+    summ = doc.get("summary")
+    raw_id = summ.get("id") if isinstance(summ, dict) else None
+    # 严格 id 白名单（0.1.5 复审三轮）：先检查原始类型为字符串（JSON 数字 12345678 绝不 str() 强转），
+    # 再校验真实 CLI ID 格式（完整 UUID 或 16+ 位规范 hex；横线畸形串如 a------- 拒绝）。
+    # 缺失/非字符串/畸形 id 一律归 unknown：不可确认，不当有效、也不当失败。
+    sid = raw_id if isinstance(raw_id, str) and re.fullmatch(
+        r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{16,}", raw_id, re.I) else ""
+
+    # —— 已写入：ok / warn（warn 也是已提交，只是带警告）——
+    if parse_ok and sid and status in ("ok", "warn"):
+        if status == "warn":
+            errs = doc.get("errors") if isinstance(doc.get("errors"), list) else []
+            warns = [str(e) for e in errs if isinstance(e, (str, int, float))][:3]
+            out = "【respire · stored】Saved with warnings"
+            if warns:
+                out += " (" + "; ".join(warns)[:160] + ")"
+            out += f": {title} ({sid[:8]})."
+        else:
+            out = f"【respire · stored】Saved: {title} ({sid[:8]})."
+        rb = _readback(bin_path, sid, title, content, _budget_left(t0))
+        if rb == "verified":
+            out += " Write verified by read-back (entry exists; id, title, and full content match)."
+        elif rb == "mismatch":
+            out += (f" Read-back shows a DIFFERENT title/content than sent — inspect rsrs show "
+                    f"{sid[:8]} before any retitle.")
+        else:
+            out += f" Read-back unavailable — if it matters, verify with rsrs show {sid[:8]}."
+        out += (" The title is a rule-based provisional one — extract a complete \"subject + action + result\" "
+                f"fact sentence from the content and replace it with rsrs retitle {sid[:8]} --title (title is "
+                "the facade for recall and dedup).")
+        return out
+
+    # —— 未写入：pending 候选（含 pre-remember veto 等一切 pending 态）——
+    if parse_ok and status == "pending":
+        items = doc.get("items") if isinstance(doc.get("items"), list) else []
+        lines = ["【respire · store pending】respire judged this item similar to existing memory (or a hook vetoed it); "
+                 "nothing was written. Candidates (read bodies with respire_show before deciding):"]
+        for it in items[:5]:
             if isinstance(it, dict):
-                lines.append(f"- [{it.get('name', '?')}] {it.get('value', '')}")
-        lines.append("Decide: to attach, resend via respire_remember with the same text and parent=<id>; if it is genuinely independent, force=true writes it directly.")
+                act = f" — suggested: {it['action']}" if it.get("action") else ""
+                lines.append(f"- [{it.get('name', '?')}] {it.get('value', '')}{act}")
+        raw_acts = doc.get("actions") if isinstance(doc.get("actions"), list) else []
+        acts = [str(a) for a in raw_acts if isinstance(a, str) and a.strip()][:6]
+        if acts:
+            lines.append("Engine-suggested next actions (prefer merge > attach > new; decide from candidate bodies, never blind-force):")
+            lines.extend(f"  {a}" for a in acts)
+        else:
+            lines.append("Decide: read the candidates above, then merge/attach (respire_remember with parent=<id>), "
+                         "or force=true only if genuinely independent.")
         return "\n".join(lines)
-    errs = doc.get("errors") or []
-    msg = json.dumps(errs, ensure_ascii=False)[:200] if errs else f"status={status or r.returncode}"
-    return f"【respire · store failed】respire did not accept it: {msg}"
+
+    # —— 引擎按当前模式拒绝执行（skip：readonly/paused 等；未写也不是失败）——
+    if parse_ok and status == "skip":
+        return ("【respire · not stored】The engine skipped the operation (read-only or paused mode); "
+                "never force a write.")
+
+    # —— 明确拒绝（白名单：仅 fail 断言 did not accept）——
+    if parse_ok and status == "fail":
+        errs = doc.get("errors") if isinstance(doc.get("errors"), list) else []
+        msg = json.dumps(errs, ensure_ascii=False)[:200] if errs else f"status=fail rc={r.returncode}"
+        return f"【respire · store failed】respire did not accept it: {msg}"
+
+    # —— 结果未知：陌生状态/缺 id/坏 summary/坏信封（engine 已回，尚有预算）→ 先只读查库 ——
+    if r is not None:
+        budget = _budget_left(t0)
+        hit = None
+        if budget >= 1.5:
+            try:
+                hit = _verify_recent_write(bin_path, t0, max_wait=budget)
+            except Exception:
+                hit = None
+        if hit:
+            hid, htitle = hit
+            return ("【respire · store unknown】The write result is unknown (unreadable receipt), and a fresh entry "
+                    f"appeared in the store — it may already be written: [{hid[:8]}] {htitle}. Verify read-only with "
+                    f"rsrs show {hid[:8]}; do NOT resend respire_remember for the same fact.")
+        return ("【respire · store unknown】The write result is unknown (engine returned an unreadable receipt). "
+                "Verify read-only: rsrs list --limit 3 --json, then rsrs show <id>. Do NOT resend respire_remember "
+                "for the same fact — resending can duplicate an already-committed write.")
+    # —— 超时/中止（预算已耗尽，不再发引擎调用）——
+    return ("【respire · store unknown】The write result is unknown (engine timed out). Verify read-only: "
+            "rsrs list --limit 3 --json, then rsrs show <id>. Do NOT resend respire_remember for the same fact — "
+            "resending can duplicate an already-committed write.")
 
 
 def do_show(bin_path: str, entry_id: str):
@@ -429,6 +605,8 @@ class RespireMemoryProvider(MemoryProvider):
         self._probe = None          # (logged, total, probe_ok) 缓存
         self._probe_at = 0.0
         self._last_store_ts = None  # 引擎侧最近落库 epoch（后台刷）
+        self._prefix_stores = {}    # 显式「记：」幂等预占：{key: {"ts":…, "state":"in-flight|written|unknown"}}（HM-04；
+        #                             0.1.4：in-flight/unknown 永不淘汰/过期；容量超限只淘汰 written，见 _evict_written）
         self._turns = 0
         self._threads = []
 
@@ -649,8 +827,66 @@ class RespireMemoryProvider(MemoryProvider):
                 if not engine:
                     return NO_RSRS
                 rest = q[m.end():].strip()
+                # HM-04 幂等预占（0.1.4 复审二轮加固）：调用 do_store **前**在锁内一步完成
+                # 「检查＋登记 in-flight」，并发重复请求不可能同时通过检查；结果三态迁移：
+                #   written（ok/warn）→ 保持占用（TTL _PREFIX_STORE_TTL，过期=可安全再存），
+                #                        重复触发回 already-submitted 回执；
+                #   unknown（超时/坏回执/缺 id）→ 永不淘汰、永不过期，回执只允许只读核实、明令禁止重发；
+                #   in-flight → 永不淘汰、无 TTL（本就短时，完成后即迁移）；
+                #   pending/fail/skip（明确未写）→ 删除键，允许模型决断后再试。
+                # 容量超 _PREFIX_STORE_CAP：只淘汰安全终态 written（先过期、再最旧，见 _evict_written）；
+                # 淘汰后仍超容（被未决项占满）→ 保守拒绝本条自动提交（固定回执，不发起 do_store）。
+                key = hashlib.sha1((session_id or self._session_id or "").encode("utf-8", "replace")
+                                   + b"\x00" + rest.strip().encode("utf-8", "replace")).hexdigest()
+                now = time.time()
+                saturated = False
+                with self._lock:
+                    prev = self._prefix_stores.get(key)
+                    state = ""
+                    if isinstance(prev, dict):
+                        st = str(prev.get("state") or "")
+                        # unknown/in-flight 永不因 TTL 失效（复审二轮：旧 30 分钟窗曾让 unknown 过期重发）
+                        if st in ("in-flight", "unknown") or (
+                                st == "written" and now - prev.get("ts", 0) < _PREFIX_STORE_TTL):
+                            state = st
+                    if not state:  # 需新占位：先容量淘汰——只淘汰安全终态 written，未决项永不淘汰
+                        if len(self._prefix_stores) > _PREFIX_STORE_CAP:
+                            self._evict_written(now)
+                            saturated = len(self._prefix_stores) > _PREFIX_STORE_CAP
+                        if not saturated:
+                            self._prefix_stores[key] = {"ts": now, "state": "in-flight"}  # 原子预占
+                if state == "in-flight":
+                    self._log("store", "prefix_inflight_skip", rest[:40])
+                    return ("【respire · store】The same store request is already in flight in this session; "
+                            "wait for its receipt — it was not sent again.")
+                if state == "written":
+                    self._log("store", "prefix_dedup_skip", rest[:40])
+                    return ("【respire · store】This exact content was already submitted in this session "
+                            "(within the last 30 minutes) — it was not sent again. If this is a different fact, "
+                            "rephrase it or add the distinguishing detail.")
+                if state == "unknown":
+                    self._log("store", "prefix_unknown_guard", rest[:40])
+                    return ("【respire · store】A previous attempt for this exact content returned an unknown result; "
+                            "verify read-only (rsrs list --limit 3 --json, then rsrs show <id>) and never resend "
+                            "respire_remember for the same fact — resending can duplicate an already-committed write.")
+                if saturated:
+                    # 保守拒绝（0.1.4 复审二轮）：幂等表被未决项占满——淘汰不动 in-flight/unknown 是刻意为之
+                    # （防重发保护不因容量失效），代价是本条自动提交不发起，交还手动落库＋只读核实。
+                    self._log("store", "prefix_table_saturated", rest[:40])
+                    return ("【respire · store】Not sent: memory idempotency table saturated with unresolved outcomes; "
+                            "store manually via rsrs and verify read-only (rsrs list --limit 3 --json, then rsrs show "
+                            "<id>). In-flight/unknown stores never lose their duplicate protection, so new automatic "
+                            "stores are conservatively rejected.")
                 self._log("store", "prefix", rest[:40])
-                return do_store(engine, rest)
+                out = do_store(engine, rest)
+                with self._lock:
+                    if "【respire · stored】" in out:
+                        self._prefix_stores[key] = {"ts": now, "state": "written"}
+                    elif "【respire · store unknown】" in out:
+                        self._prefix_stores[key] = {"ts": now, "state": "unknown"}
+                    else:  # pending/fail/skip/空内容＝明确未写：解除占用，允许决断后再试
+                        self._prefix_stores.pop(key, None)
+                return out
             if len(q) < int(self._cfg.get("min_prompt_chars", 2)):
                 return None
             if not engine:
@@ -659,16 +895,18 @@ class RespireMemoryProvider(MemoryProvider):
                              int(self._cfg.get("recall_limit", 5)),
                              float(self._cfg.get("recall_threshold", 0.0)),
                              int(self._cfg.get("budget_chars", 1500)))
-            if not text:
-                return None
-            # 存储催促（Stop 钩子的等价物）：节流到每 N 轮、近 10 分钟引擎无落库才附
+            # 存储催促（Stop 钩子的等价物，HM-01 修复）：节流到每 N 轮、近窗引擎无落库才附。
+            # 判定独立于召回命中——零命中/新主题同样要催；空库（_last_store_ts=None）同样视为「近窗无落库」。
             every = int(self._cfg.get("store_nudge_every", 1))
+            nudge = ""
             if every > 0 and self._turns > 0 and self._turns % every == 0:
                 last = self._last_store_ts
-                if last is not None and time.time() - last > 600:
-                    text += "\n" + STORE_NUDGE
+                if last is None or time.time() - last > 600:
+                    nudge = "\n" + STORE_NUDGE
+            if not text:
+                return nudge.strip() or None
             self._log("prefetch", "hit", f"turns={self._turns} q={q[:40]}")
-            return text
+            return text + nudge
         except Exception as e:
             logger.warning("prefetch failed: %s", e)
             return None  # fail-open
@@ -750,6 +988,25 @@ class RespireMemoryProvider(MemoryProvider):
                   "配置文件 $HERMES_HOME/respire.json（可选字段见插件 README）。")
 
     # ---- 内部 ----
+
+    def _evict_written(self, now: float) -> None:
+        """幂等表容量淘汰（0.1.4 复审二轮）：**只淘汰安全终态 written**——先清 TTL 已过期的
+        written（本就可再存、留着只占位），再按 ts 从旧到新淘汰其余 written，直到规模回到上限内。
+        in-flight/unknown 永不淘汰：未知/未决结果的防重发保护绝不因容量清理失效
+        （旧实现 clear() 全清曾让未决项失去保护、可被重复提交）。调用方须已持有 self._lock。"""
+        for k in [k for k, v in self._prefix_stores.items()
+                  if isinstance(v, dict) and str(v.get("state") or "") == "written"
+                  and now - float(v.get("ts") or 0) >= _PREFIX_STORE_TTL]:
+            self._prefix_stores.pop(k, None)
+        if len(self._prefix_stores) <= _PREFIX_STORE_CAP:
+            return
+        oldest = sorted((k for k, v in self._prefix_stores.items()
+                         if isinstance(v, dict) and str(v.get("state") or "") == "written"),
+                        key=lambda k: float(self._prefix_stores[k].get("ts") or 0))
+        for k in oldest:
+            if len(self._prefix_stores) <= _PREFIX_STORE_CAP:
+                break
+            self._prefix_stores.pop(k, None)
 
     def _data_dir(self) -> str:
         base = self._hermes_home or os.path.dirname(os.path.abspath(__file__))
