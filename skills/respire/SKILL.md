@@ -10,7 +10,7 @@ The provider injects brief rules, status guidance, and per-turn title recall. If
 ## Tools and commands
 
 - `respire_recall(query, limit?)` — recall before answering (an empty injection never means no memory; search manually); on errors, recall by the original error text first. Equivalent shell: `rsrs recall "project name + keywords" --limit 5 --json --titles`
-- `respire_remember(content, title?, importance?, parent?, force?)` — reviewed new-entry storage. Important entries require `parent`; pending means nothing was written. Read bodies and decide placement first. `force` is a legacy override, never a way to bypass review.
+- `respire_remember(content, title?, importance?, parent?, force?)` — reviewed new-entry storage. Important entries require `parent`; pending means nothing was written. Read bodies and decide placement first. `force` is rejected by the write guard. You MUST use one explicit literal command per write; DO NOT clear a parent. A parent lookup failure leaves the write pending.
 - `respire_show(id)` — the first 8 chars of the id suffice to read the full body (with causal-chain context); `rsrs chain` fetches the whole causal chain
 - shell passthrough: `rsrs prompt --json`, `rsrs candidates <content> --json` (pre-store review), shell rsrs update/merge operations after reading bodies, `rsrs forget <id>` (tombstone delete), `rsrs sync`, `rsrs status`, `rsrs prompt`, `rsrs tree/resort/retitle` (causal tree upkeep). Follow the installed CLI's help and policy.
 

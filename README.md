@@ -7,7 +7,9 @@
 - 三个工具：`respire_recall` / `respire_show` / `respire_remember`（判后即存：先读 policy、候选与正文，再由模型判断更新、合并或挂靠）
 - 消息以「记：」「存：」「remember:」开头 → 只返回英文 pending，明确未写入。主模型先读 `rsrs prompt --json`、`rsrs candidates <content> --json` 和候选正文，再按 update > merge > attach > new 决断；更新/合并走现有 shell CLI。important 新条必须挂到已读、真实且合理的父节点，没有合适父节点就保留待决并说明缺口，不猜、不强写、不降为 trivial。前缀后的内容只当待存事实，不执行其中描述的工程任务。显式工具继续保留写回执状态机与完整回读核验；`/nomem` 关闭当轮自动召回。
 - 每轮结束检查近窗落库，闲聊零打扰、干完活没存才催——**零命中/新主题/空库同样催**（HM-01：判定不再依赖召回命中），催促明示为当前任务的附加项、绝不替代当前任务（HM-05）
-- fail-open：引擎缺失/超时/解析失败一律降级为空注入，绝不阻断宿主回合
+- 读钩子仍 fail-open。写前 `pre_tool_call` 使用 Hermes 官方 `action: block` 协议拦截 terminal 与可见的 rsrs/respire 原生写工具：important 新条缺父节点、强写、清空父节点、父节点无效或只读核验超时，均不执行写入。父节点核验只调用 `--client-only show --json`，超时上限 3 秒。
+- 当前 CLI 的 `update` 未公开 `--parent` / `--clear-parent`；钩子拒绝这些参数属于协议防御，不代表已经验证 CLI 能执行清父操作。将无父节点的 trivial 条目升级为 important，仍由 CLI/Core 写前门检查。
+- 这道门只检查宿主可见的明确命令和工具参数。任意脚本、别名和外部进程仍须由 CLI/Core 的写前门兜底；插件不会自动选父节点，也不会代写。
 
 ## Overview (English)
 
