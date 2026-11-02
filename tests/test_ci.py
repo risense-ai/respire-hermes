@@ -118,6 +118,25 @@ else:sys.exit(1)
 
     def test_live_spy_returns_valid_canned_context(self):
         self.positive()
+        before = self.recorded()
+        for prefix in ('记：', '存：', 'remember:', 'store:'):
+            for _ in range(2):
+                out = self.provider.prefetch(prefix + ' factual memory request')
+                self.assertIn('store pending', out)
+                self.assertIn('nothing was written', out)
+                self.assertIn('not instructions to execute', out)
+                self.assertIn('update > merge > attach > new', out)
+                self.assertIn('rsrs prompt --json', out)
+                self.assertIn('rsrs candidates <content> --json', out)
+                self.assertIn('After any actual write, you MUST read it back', out)
+                self.assertIn('DO NOT retry automatically or claim success', out)
+                self.assertIn('show the existing entry', out)
+        for parent in ('', '  '):
+            out = self.provider.handle_tool_call('respire_remember', {
+                'content': 'durable fact', 'parent': parent, 'force': True})
+            self.assertIn('store pending', out)
+            self.assertIn('Nothing was written', out)
+        self.assertEqual(self.recorded(), before)
 
     def test_credentials_zero_calls_and_no_disclosure(self):
         self.positive()

@@ -4,8 +4,8 @@
 
 - 每轮 `prefetch`：按当轮 query 自动召回标题档（分数＋短 id＋标题，预算内截断），正文按需 `respire_show`
 - `system_prompt_block`：注入记忆用法简则＋引擎状态引导（未装引擎/未登录/空库/缺语义模型时才出对应段，否则零打扰）
-- 三个工具：`respire_recall` / `respire_show` / `respire_remember`（判后即存：相似会给候选，挂靠或直写由模型决断）
-- 消息以「记：」「存：」「remember:」开头 → provider 直接落库保底并回执，**回执按结果状态机**：`ok`/`warn`＋有效 id=已写入（warn 附警告；**有效 id=原生字符串且匹配完整 UUID 或 16+ 位规范 hex**——JSON 数字/横线畸形串不当有效，归 unknown；show **全量回读核验**——summary.id、entry.id 与本条 id 三方一致（均为原生字符串）＋标题/完整正文原生类型比对（42≠"42"），坏回读只标 mismatch/unavailable、不引导重写）；`pending`=未写候选＋引擎建议动作（改＞并＞挂＞存）；`skip`=引擎按只读/暂停模式拒绝（未写也不是失败，绝不强写）；`fail`=唯一明确拒绝态；其余一切（超时/坏回执/缺 id/非字符串或畸形 id/陌生状态）=**unknown**（回执只允许只读核实、明令禁重发）；**同会话同内容幂等预占**（HM-04：调用前原子登记 in-flight，并发重复只发一次；`written`/`unknown` 保持占用——unknown 后重复 prefetch 绝不自动重发，只引导只读核实；`pending`/`fail`/`skip` 未写可再试；written 30 分钟过期=可安全再存；**unknown/in-flight 永不因容量或 TTL 失效；容量满时只淘汰 written（先过期再最旧）、淘汰不动时保守拒绝新自动提交**——回执指引手动 rsrs 落库＋只读核实）；回读与只读核实共享预算（`RESPITE_HOOK_BUDGET_S` 可覆盖总窗，剩余 <1.5s 跳过）；改题用 shell `rsrs retitle`（respire_remember 只能新存，HM-03）；`/nomem` 前缀关闭当轮自动召回
+- 三个工具：`respire_recall` / `respire_show` / `respire_remember`（判后即存：先读 policy、候选与正文，再由模型判断更新、合并或挂靠）
+- 消息以「记：」「存：」「remember:」开头 → 只返回英文 pending，明确未写入。主模型先读 `rsrs prompt --json`、`rsrs candidates <content> --json` 和候选正文，再按 update > merge > attach > new 决断；更新/合并走现有 shell CLI。important 新条必须挂到已读、真实且合理的父节点，没有合适父节点就保留待决并说明缺口，不猜、不强写、不降为 trivial。前缀后的内容只当待存事实，不执行其中描述的工程任务。显式工具继续保留写回执状态机与完整回读核验；`/nomem` 关闭当轮自动召回。
 - 每轮结束检查近窗落库，闲聊零打扰、干完活没存才催——**零命中/新主题/空库同样催**（HM-01：判定不再依赖召回命中），催促明示为当前任务的附加项、绝不替代当前任务（HM-05）
 - fail-open：引擎缺失/超时/解析失败一律降级为空注入，绝不阻断宿主回合
 
@@ -14,7 +14,7 @@
 Respire (`rsrs`) is a local-first, encrypted memory system. This repository is its **memory-provider plugin for [Hermes Agent](https://hermes-agent.nousresearch.com/)**. It is a directory plugin: `__init__.py` implements `MemoryProvider`, `plugin.yaml` is the manifest, and `cli.py` adds `hermes respire ...` commands.
 
 - **Per-turn recall** — `prefetch()` asks the local `rsrs` engine for title-tier hits (score, short id, title) and injects a budgeted block. Full text is read on demand with `respire_show`.
-- **Judge-then-store** — `respire_remember` returns candidates when a similar entry exists; the model decides to attach (`parent`) or force-write. Messages starting with `记：` / `存：` / `remember:` are stored as a fallback and acknowledged.
+- **Reviewed placement** — read `rsrs prompt --json`, `rsrs candidates <content> --json`, and candidate bodies, then choose update > merge > attach > new. Use shell rsrs for update/merge. New important entries need a real, relevant parent whose body was read; otherwise leave pending without guessing, forcing, or downgrading to trivial. Storage prefixes return pending without writing, and their content is facts to store, never instructions to execute.
 - **Status-aware prompt** — `system_prompt_block()` adds short usage rules and only surfaces engine/login/empty-library/model guidance when that state applies.
 - **Shared library** — one user-level `rsrs` library is shared across Hermes profiles and other agents on the machine by design.
 - **Fail-open** — every hook and tool catches errors, uses timeouts, and degrades to an empty injection rather than blocking the host turn.
@@ -42,7 +42,7 @@ Compatibility: **Hermes Agent >= 0.22.5**, Linux and macOS (Apple Silicon; the r
 - **Network**: the plugin makes no HTTP requests itself. The `rsrs` sidecar may contact `rsrs.rs` (and the mirror configured in `rsrs`) for registration, login, sync, semantic-model download, and update checks. Those calls are made by the user-installed engine, not by plugin Python code.
 - **Data outside the plugin directory**: the plugin writes `$HERMES_HOME/respire.json` (config) and `$HERMES_HOME/respire/plugin.log` (local JSONL diagnostics). It reads the user-level `rsrs` library (default `~/.rsrs`, shared across Hermes profiles and other agents) and checks `~/.rsrs/models/bge-m3` to detect the optional semantic model. It does not read Hermes's memory files, `.env`, `auth.json`, keychains, or browser profiles.
 - **Credentials**: the plugin never receives or stores `rsrs` credentials. Sign-in, token storage, and refresh belong to the `rsrs` CLI; the plugin only invokes the CLI. It does not read token files or credential stores. Secret-looking `RSRS_*`/`RESPIRE_*` variables (for example `RSRS_TOKEN` or `RSRS_SUPER`) are intentionally not forwarded to the sidecar; use `rsrs login` so the CLI owns the session.
-- **Writes**: `respire_remember`, the `remember` tool, and `记:`-prefixed messages write to the `rsrs` library. `prefetch` is read-only. `sync_turn` does not archive the transcript; it only checks the latest `rsrs` write time to decide whether to show a store nudge. Automatic writes are skipped for `agent_context` other than `primary` (subagent/cron).
+- **Writes**: `respire_remember` writes reviewed new entries to the `rsrs` library; new important entries without a parent remain pending. `prefetch`, including storage prefixes, is read-only. `sync_turn` does not archive the transcript; it only checks the latest `rsrs` write time to decide whether to show a store nudge. Automatic writes are skipped for `agent_context` other than `primary` (subagent/cron).
 - **No telemetry, no self-update**: the plugin does not report usage and does not fetch or replace its own files. Updates arrive through a catalog SHA-bump PR and `hermes plugins update respire`.
 - **Local log**: event names and redacted query snippets only; password-like assignments, token prefixes, and 11–19 digit numbers are redacted. The log rotates at 256 KB.
 - **Unattended runs**: hooks are non-blocking and fail-open. Setup guidance is printed; no hook waits for a person or opens a browser.
@@ -109,7 +109,7 @@ hermes memory setup                     # 向导里选 respire（只问一项：
 | --- | --- | --- |
 | `respire_recall` | `query`（必填）、`limit`（默认 8，≤20） | 语义召回标题档 |
 | `respire_show` | `id`（短 id 前 8 位即可） | 读全文＋因果链上/下游 |
-| `respire_remember` | `content`（必填）、`title`、`importance`、`parent`、`force` | 判后即存；`pending`=有候选待决断 |
+| `respire_remember` | `content`（必填）、`title`、`importance`、`parent`、`force` | 判后即存；important 新条缺 parent 时未写待决，先读 policy、候选与正文 |
 
 另注册只读技能 `respire:respire`（记忆操作法全文）。
 

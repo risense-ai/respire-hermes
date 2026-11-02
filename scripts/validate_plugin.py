@@ -95,7 +95,7 @@ def main() -> int:
         r = inst.handle_tool_call("respire_recall", {})
         check("handle_tool_call empty args no-raise", isinstance(r, str))
         r = inst.handle_tool_call("no_such_tool", {"x": 1})
-        check("unknown tool no-raise", isinstance(r, str) and "未知工具" in r)
+        check("unknown tool no-raise", isinstance(r, str) and "Unknown tool" in r)
         check("prefetch None on empty", inst.prefetch("") is None)
         check("prefetch /nomem skip", inst.prefetch("/nomem something") is None)
         check("system_prompt_block no-raise", isinstance(inst.system_prompt_block(), str))

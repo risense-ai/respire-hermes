@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.6 — reviewed memory placement and English model prompts
+
+- Storage prefixes now return pending with no write. The main model reviews policy, candidates, and bodies before update > merge > attach > new; prefixed facts never become instructions to execute.
+- Important new entries without a parent stay pending, including force requests. Require a real, relevant parent whose body was read; never guess, force, or downgrade to trivial.
+- Translate tool schemas, tool responses, configuration guidance, and skill registration text to English. Keep Chinese input prefixes compatible.
+- Remove obsolete prefix auto-write idempotency state; preserve explicit-tool receipt and read-back checks. Update existing checks for the reviewed workflow; no new test files.
+
 ## 0.1.5 — 复审三轮整改：严格原生字符串 id 白名单＋回读三方一致/原生类型（PR #6 复核 P2）
 
 ### Fixed
