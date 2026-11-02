@@ -12,7 +12,7 @@
 #   3. register(ctx) 每次构造新实例（multiplexed gateway 禁模块级单例）；
 #   4. 配置边车 $HERMES_HOME/respire.json（read_json_or_empty / atomic_json_write）；
 #   5. wrapper 式零 Python 依赖面（引擎=npm 装的 rsrs CLI sidecar）→ hermes update 不动本目录。
-# 铁律: fail-open —— 生命周期钩子与工具调用绝不抛异常阻断宿主；引擎缺失=降级为空注入。
+# 读取与生命周期故障仍降级；pre_tool_call 写门返回 block，拒绝后不执行工具。
 from __future__ import annotations
 
 import datetime
@@ -26,7 +26,7 @@ import threading
 import time
 from pathlib import Path
 
-VERSION = "0.1.6"
+VERSION = "0.1.7"
 PROVIDER_NAME = "respire"
 
 logger = logging.getLogger("hermes.plugins.respire")
@@ -373,8 +373,206 @@ def _verify_recent_write(bin_path: str, t0: float, max_wait: float = 0):
     return str(best.get("id") or ""), str(best.get("title") or "")
 
 
+WRITE_BLOCK = ("Respire blocked this memory write. You MUST read rsrs prompt --json, run rsrs candidates "
+               "<content> --json, and read a real, relevant parent body BEFORE writing. "
+               "Important entries MUST have an existing parent. DO NOT use --force, clear a parent, guess, "
+               "or downgrade to trivial. If no parent fits, leave pending. Use one explicit literal rsrs "
+               "command at a time. After a permitted write, you MUST read it back and verify id, title, "
+               "and full content; an unknown result MUST NOT be retried automatically.")
+_PARENT_ID = re.compile(r"(?:[0-9a-f]{8,}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})", re.I)
+
+
+def write_parent_error(args, check_parent, check_update=None):
+    """Parse actual CLI options; content cannot supply a parent."""
+    if "--help" in args[1:] or "-h" in args[1:]:
+        return None
+    values, positional = {}, []
+    takes_value = {"--title", "--importance", "--parent", "--content", "--id", "--project",
+                   "--tags", "--type", "--kind", "--summary", "--computer", "--emotion",
+                   "--source-refs", "--valid-until", "--review-at", "--artifact", "--merge-ids",
+                   "--supersedes", "--see-also", "--model-task-id", "--progress-id"}
+    i = 1
+    while i < len(args):
+        token = args[i]
+        key, equal, value = token.partition("=")
+        if key in {"--force", "--clear-parent"}:
+            return WRITE_BLOCK
+        if key in takes_value:
+            if key in values:
+                return WRITE_BLOCK
+            if not equal:
+                i += 1
+                if i >= len(args) or args[i].startswith("--"):
+                    return WRITE_BLOCK
+                value = args[i]
+            values[key] = value
+        elif token in {"--json", "--client-only", "--no-autostart", "--direct", "--clear-summary",
+                       "--clear-source-refs", "--clear-valid-until", "--clear-review-at", "--clear-artifact"}:
+            pass
+        elif token.startswith("-"):
+            return WRITE_BLOCK
+        else:
+            positional.append(token)
+        i += 1
+    parent = values.get("--parent")
+    if args[0] == "remember":
+        needs_parent = values.get("--importance", "trivial") != "trivial" or "--merge-ids" in values
+        if needs_parent and not parent:
+            return WRITE_BLOCK
+    if parent is not None:
+        if not _PARENT_ID.fullmatch(parent) or not check_parent(parent):
+            return WRITE_BLOCK
+    if args[0] == "update" and values.get("--importance") == "important":
+        if not positional or check_update is None or not check_update(positional[0]):
+            return WRITE_BLOCK + " The target needs an existing valid parent; review and attach it before promoting it."
+    return None
+
+
+def guard_memory_tool(tool_name, args, check_parent, check_update=None, provider_tool=False, _wrapped=False):
+    """Guard visible rsrs CLI/native calls without running the requested write."""
+    # shortcut: scripts and aliases are opaque here; Core must guard those write paths.
+    import shlex
+    name = str(tool_name or "")
+    known = re.fullmatch(r"(?:(?:respire|rsrs|memory)_|mcp__[^\s]*(?:respire|rsrs|memory)[^\s]*__)(?:memory_)?(remember|update)", name, re.I)
+    if known:
+        if not (provider_tool and name == "respire_remember"):
+            return WRITE_BLOCK + " This tool's memory store is not bound to the configured CLI. Use an explicit rsrs CLI command instead."
+        if not isinstance(args, dict):
+            return WRITE_BLOCK
+        if args.get("force") or args.get("clear_parent") or args.get("clearParent"):
+            return WRITE_BLOCK
+        parent = args.get("parent")
+        if args.get("importance", "important") != "trivial" and not parent:
+            return WRITE_BLOCK
+        if "parent" in args and (not isinstance(parent, str) or not _PARENT_ID.fullmatch(parent)
+                                 or not check_parent(parent)):
+            return WRITE_BLOCK
+        return None
+    if name.lower() not in {"bash", "powershell", "execute_command", "terminal"}:
+        return None
+    command = args.get("command") if isinstance(args, dict) else None
+    if not isinstance(command, str):
+        return None
+    # Keep operator provenance: a quoted ">" or "%" is memory content, not shell syntax.
+    pattern = r"""(?:'[^']*'|"(?:\\.|[^"\\])*"|\\[^\r\n]|[^\s;&|<>()'"\\])+|[;&|<>()]+|[\r\n]+"""
+    parts, cursor, malformed = [], 0, False
+    for match in re.finditer(pattern, command):
+        if command[cursor:match.start()].strip():
+            malformed = True
+            break
+        raw = match.group()
+        operator = raw[0] in ";&|<>()\r\n"
+        if operator:
+            parts.append((";" if raw[0] in "\r\n" else raw, True, False))
+        else:
+            try:
+                lexer = shlex.shlex(raw, posix=True)
+                lexer.whitespace_split, lexer.commenters = True, ""
+                if re.match(r"""^['"]?[A-Za-z]:[\\/]""", raw):
+                    lexer.escape = ""
+                word = "".join(lexer)
+            except ValueError:
+                malformed = True
+                break
+            expanded = re.sub(r"'[^']*'", "", raw)
+            dynamic = bool(re.search(r"\$(?:[A-Za-z_0-9{(?@*!#-])|\x60|%[A-Za-z_][A-Za-z_0-9]*%", expanded))
+            parts.append((word, False, dynamic))
+        cursor = match.end()
+    malformed = malformed or bool(command[cursor:].strip())
+    tokens, redirected = [], False
+    i = 0
+    while i < len(parts):
+        word, operator, dynamic = parts[i]
+        if not operator and word.isdigit() and i + 1 < len(parts) and parts[i + 1][1] and any(c in parts[i + 1][0] for c in "<>"):
+            i += 1
+            continue
+        if operator and any(c in word for c in "<>"):
+            redirected = True
+            i += 2  # Discard only the real redirection operator and its target.
+            continue
+        tokens.append((word, operator, dynamic))
+        i += 1
+    words = [part[0] for part in tokens]
+    calls = []
+    for i, (word, operator, dynamic) in enumerate(tokens[:-1]):
+        executable = word.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if operator or executable not in {"rsrs", "rsrs.cmd", "rsrs.exe", "rsrs-cli", "rsrs-cli.cmd", "rsrs-cli.exe"}:
+            continue
+        sub = i + 1
+        while sub < len(words):
+            flag, equal, value = words[sub].partition("=")
+            if flag in {"--json", "--client-only", "--no-autostart", "--direct", "--"}:
+                sub += 1
+            elif flag in {"--model-task-id", "--progress-id"}:
+                sub += 1 if equal else 2
+            else:
+                break
+        if sub >= len(words) or words[sub] not in {"remember", "update"}:
+            continue
+        if (i == 0 or tokens[i - 1][1] or words[i - 1] in {"command", "exec", "npx", "-y", "--yes"}
+                or words[0].lower() in {"env", "sudo", "nohup", "timeout"}
+                or all(re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*=.*", value) for value in words[:i])):
+            calls.append((i, sub))
+    if not calls:
+        # Inspect only explicit shell bodies and command substitutions; never run them.
+        nested = []
+        if words and words[0].lower() in {"bash", "sh", "pwsh", "powershell", "cmd", "cmd.exe"}:
+            nested.extend(words[1:])
+        for word, operator, dynamic in parts:
+            if dynamic:
+                nested.extend(re.findall(r"\$\((.*?)\)", word, re.S))
+        if name.lower() != "powershell":
+            expanded = re.sub(r"'[^']*'", "", command)
+            nested.extend(re.findall(r"(?<!\\)\x60(.*?)(?<!\\)\x60", expanded, re.S))
+        for body in nested:
+            if guard_memory_tool(tool_name, {"command": body}, check_parent, check_update, _wrapped=True):
+                return WRITE_BLOCK
+        return None
+    if _wrapped:
+        if len(calls) == 1 and any(flag in words[calls[0][1] + 1:] for flag in ("--help", "-h")):
+            return None
+        return WRITE_BLOCK
+    if len(calls) != 1 or malformed or redirected or any(operator or dynamic for _, operator, dynamic in tokens):
+        return WRITE_BLOCK
+    start, sub = calls[0]
+    if start and words[:start] not in (["npx"], ["npx", "-y"], ["npx", "--yes"], ["command"], ["exec"]):
+        return WRITE_BLOCK
+    return write_parent_error(words[sub:], check_parent, check_update)
+
+
+def read_guard_entry(bin_path, entry_id):
+    if not bin_path or not isinstance(entry_id, str) or not _PARENT_ID.fullmatch(entry_id):
+        return None
+    try:
+        result = run_rsrs(bin_path, ["--client-only", "show", entry_id, "--json"], 3)
+        doc = json.loads(result.stdout)
+        entry = doc.get("details", {}).get("entry")
+        summary = doc.get("summary")
+        eid = entry.get("id") if isinstance(entry, dict) else None
+        if (result.returncode == 0 and doc.get("status") == "ok"
+                and isinstance(summary, dict) and summary.get("id") == eid
+                and isinstance(eid, str) and bool(re.fullmatch(
+                    r"[0-9a-f]{16,}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", eid, re.I))
+                and eid.lower().startswith(entry_id.lower())
+                and isinstance(entry.get("title"), str) and isinstance(entry.get("content"), str)):
+            return entry
+    except Exception:
+        pass
+    return None
+
+
+def parent_exists(bin_path, parent):
+    return read_guard_entry(bin_path, parent) is not None
+
+
+def update_parent_exists(bin_path, entry_id):
+    entry = read_guard_entry(bin_path, entry_id)
+    parent = entry.get("parent_id") if entry else None
+    return (isinstance(parent, str) and parent.lower() != entry["id"].lower()
+            and parent_exists(bin_path, parent))
+
 def do_store(bin_path: str, content: str, title: str = "", importance: str = "important",
-             parent: str = "", force: bool = False):
+             parent: str | None = None, force: bool = False):
     """写回执状态机（对齐 CLI 信封语义，审计报告 §7.1/§7.2）：
       ok/warn + 有效 summary.id → 已写入：show 全量回读核验后回执（verified/mismatch/unavailable 如实标注）
       pending → 未写入：转述候选（items 带短 id）＋引擎建议动作（改＞并＞挂＞存）
@@ -387,26 +585,19 @@ def do_store(bin_path: str, content: str, title: str = "", importance: str = "im
     返回回执文本，绝不抛异常。"""
     if not content:
         return "【respire · store】Content is empty; nothing was stored."
+    t0 = time.time()
+    if guard_memory_tool("respire_remember", {"importance": importance, "force": force, **({"parent": parent} if parent is not None else {})},
+                         lambda value: parent_exists(bin_path, value), provider_tool=True):
+        return "【respire · store pending】Nothing was written. " + WRITE_BLOCK
     parent = (parent or "").strip()
-    if importance != "trivial" and not parent:
-        return ("【respire · store pending】Nothing was written: a new important entry needs a parent. "
-                "You MUST read rsrs prompt --json, run rsrs candidates <content> --json, and read candidate bodies with respire_show BEFORE choosing a write action. "
-                "Choose update > merge > attach > new; use shell rsrs for update/merge. "
-                "Create an important entry ONLY AFTER reading a real, relevant parent body; pass its id. "
-                "If no parent fits, you MUST leave pending and explain what is missing. "
-                "DO NOT guess, force, or downgrade to trivial. "
-                "After any actual write, you MUST read it back with respire_show and check id, title, and full content. If the result is unknown, DO NOT retry automatically or claim success. Verify read-only with rsrs list --limit 3 --json and respire_show. If the fact is already stored, you MUST show the existing entry; DO NOT store another copy.")
     title = (title or "").strip() or extract_title(content) or "respire quick store"
     args = ["remember", content, "--title", title, "--importance",
             "trivial" if importance == "trivial" else "important", "--json"]
     if parent:
         args += ["--parent", parent]
-    if force:
-        args += ["--force"]
-    t0 = time.time()
     r = None
     try:
-        r = run_rsrs(bin_path, args, STORE_T)
+        r = run_rsrs(bin_path, args, max(1, STORE_T - (time.time() - t0)))
     except Exception as e:
         logger.warning("store timeout/error: %s", e)
     doc, parse_ok = {}, False
@@ -695,7 +886,7 @@ class RespireMemoryProvider(MemoryProvider):
                             "importance": {"type": "string", "enum": ["important", "trivial"],
                                            "description": "Durable conclusions: important; process diary only: trivial", "default": "important"},
                             "parent": {"type": "string", "description": "Required for new important entries: real, relevant parent id after reading its body"},
-                            "force": {"type": "boolean", "description": "Legacy override; never use to bypass placement or candidate review."},
+                            "force": {"type": "boolean", "description": "Rejected by the write guard. DO NOT use force; leave pending when no reviewed parent fits."},
                         },
                         "required": ["content"],
                     },
@@ -741,7 +932,7 @@ class RespireMemoryProvider(MemoryProvider):
                 out = do_store(engine, content,
                                title=str(args.get("title") or ""),
                                importance=str(args.get("importance") or "important"),
-                               parent=str(args.get("parent") or ""),
+                               parent=args.get("parent"),
                                force=bool(args.get("force")))
                 self._spawn(self._refresh_last_store)  # 落库后即时刷新催促判定缓存
                 return out
@@ -1038,7 +1229,22 @@ SKILLS_DIR = Path(__file__).parent / "skills"
 
 def register(ctx) -> None:
     """记忆插件发现系统入口。契约：每次构造新实例（禁模块级单例——multiplexed gateway 每剖面一实例）。"""
-    ctx.register_memory_provider(RespireMemoryProvider())
+    provider = RespireMemoryProvider()
+    ctx.register_memory_provider(provider)
+
+    def pre_tool_call(tool_name="", args=None, **kwargs):
+        try:
+            reason = guard_memory_tool(tool_name, args,
+                lambda parent: parent_exists(provider._engine or find_rsrs(provider._cfg), parent),
+                lambda target: update_parent_exists(provider._engine or find_rsrs(provider._cfg), target),
+                provider_tool=True)
+        except Exception:
+            reason = WRITE_BLOCK
+        if reason:
+            return {"action": "block", "message": reason}
+        return None
+
+    ctx.register_hook("pre_tool_call", pre_tool_call)
     try:
         ctx.register_skill(
             "respire",

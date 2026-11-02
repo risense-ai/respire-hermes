@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.7 — 2026-11-02
+
+- 注册真实 `pre_tool_call` 写前门，拒绝缺父节点、强写、清父节点参数及不可解析的可见 rsrs 写入；保留 CLI 默认 trivial、help 和正文中的字面字符。
+- 结构写另行核验：merge 必须显式挂父，important 更新必须已有有效父节点。未绑定目标库的 MCP/native 写入直接拒绝，Hermes 自有 provider 单独验证。
+- 父节点用只读 show 在 3 秒内核验；修复 `respire_remember(force=true)` 的透传通道。
+- 保留普通工具与读取行为，明确插件可见范围及 CLI/Core 的兜底责任。
+
 ## 0.1.6 — reviewed memory placement and English model prompts
 
 - Storage prefixes now return pending with no write. The main model reviews policy, candidates, and bodies before update > merge > attach > new; prefixed facts never become instructions to execute.
