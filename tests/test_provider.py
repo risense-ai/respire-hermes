@@ -73,24 +73,40 @@ ctx1, ctx2 = FakeCtx(), FakeCtx()
 mod.register(ctx1)
 mod.register(ctx2)
 check("pre_tool_call registered", callable(ctx1.hooks.get("pre_tool_call")))
-check("terminal missing parent blocked", ctx1.hooks["pre_tool_call"](tool_name="terminal", args={"command": "rsrs remember fact"})["action"] == "block")
+check("terminal missing parent blocked", ctx1.hooks["pre_tool_call"](tool_name="terminal", args={"command": "rsrs remember fact --importance important"})["action"] == "block")
 check("unrelated terminal unaffected", ctx1.hooks["pre_tool_call"](tool_name="terminal", args={"command": "echo hello"}) is None)
-for command in ["rsrs remember 'body --parent aaaabbbb'", "rsrs remember fact --parent ''",
+for command in ["rsrs remember 'body --parent aaaabbbb' --importance important", "rsrs remember fact --parent ''",
                 "rsrs remember fact --parent aaaabbbb --force", "rsrs update deadbeef --clear-parent",
                 "rsrs remember fact --parent none", "echo ok; rsrs remember fact",
                 "echo ok\nrsrs remember fact", "rsrs remember fact --parent $P",
                 "rsrs remember fact --parent aaaabbbb | cat", "env X=y rsrs remember fact",
-                "rsrs --model-task-id task remember fact", "echo ok |& rsrs remember fact", ">out rsrs remember fact",
-                "echo $(rsrs remember fact)", "npx rsrs remember fact"]:
+                "rsrs --model-task-id task remember fact --importance important", "echo ok |& rsrs remember fact", ">out rsrs remember fact",
+                "echo $(rsrs remember fact)", "npx rsrs remember fact --importance important",
+                "rsrs >out.log remember fact --importance important --force",
+                "rsrs remember combined --importance trivial --merge-ids aaaabbbb",
+                "rsrs update aaaabbbb --importance important",
+                'echo "$(rsrs >out remember fact --importance important)"',
+                'echo >"$(rsrs remember fact --force)"',
+                "echo " + chr(96) + "rsrs remember fact --force" + chr(96)]:
     check("guard rejects unsafe CLI write", bool(mod.guard_memory_tool("terminal", {"command": command}, lambda p: True)))
 check("read query remember unaffected", mod.guard_memory_tool("terminal", {"command": "rsrs recall remember --titles --json"}, lambda p: False) is None)
-check("global flags write blocked", bool(mod.guard_memory_tool("terminal", {"command": "rsrs --client-only --json remember fact"}, lambda p: True)))
+check("global flags write blocked", bool(mod.guard_memory_tool("terminal", {"command": "rsrs --client-only --json remember fact --importance important"}, lambda p: True)))
 check("literal valid parent permitted", mod.guard_memory_tool("terminal", {"command": "rsrs remember fact --parent aaaabbbb"}, lambda p: True) is None)
 check("invalid parent blocked", bool(mod.guard_memory_tool("terminal", {"command": "rsrs remember fact --parent aaaabbbb"}, lambda p: False)))
 check("trivial without parent permitted", mod.guard_memory_tool("terminal", {"command": "rsrs remember fact --importance trivial"}, lambda p: False) is None)
 check("valid metadata options permitted", mod.guard_memory_tool("terminal", {"command": "rsrs remember fact --parent aaaabbbb --project p --tags t --type context --summary s --emotion -1 --clear-review-at"}, lambda p: True) is None)
 check("quoted command text unaffected", mod.guard_memory_tool("terminal", {"command": "echo 'rsrs remember fact --force'"}, lambda p: False) is None)
 check("native empty parent blocked", bool(mod.guard_memory_tool("respire_remember", {"importance": "trivial", "parent": ""}, lambda p: True)))
+for command in ["rsrs remember --help", "rsrs remember diary",
+                'bash -c "rsrs recall remember --titles --json"',
+                'echo "$(rsrs --client-only recall remember)"',
+                'rsrs remember "CPU dropped 50%" --importance important --parent aaaabbbb',
+                'rsrs remember ">" --importance important --parent aaaabbbb']:
+    check("read help and literal CLI content permitted", mod.guard_memory_tool("terminal", {"command": command}, lambda p: True) is None)
+for name in ["memory_remember", "mcp__rsrs__memory_remember"]:
+    check("unbound memory tool blocked", bool(mod.guard_memory_tool(name, {"importance": "important", "parent": "aaaabbbb"}, lambda p: True)))
+check("bound Hermes provider permitted", mod.guard_memory_tool("respire_remember", {"importance": "important", "parent": "aaaabbbb"}, lambda p: True, provider_tool=True) is None)
+check("update with verified existing parent permitted", mod.guard_memory_tool("terminal", {"command": "rsrs update aaaabbbb --importance important"}, lambda p: True, lambda target: True) is None)
 check("native force blocked", bool(mod.guard_memory_tool("respire_remember", {"parent": "aaaabbbb", "force": True}, lambda p: True)))
 check("register 注册 provider", len(ctx1.providers) == 1 and ctx1.providers[0].name == "respire")
 check("register 每次 new 实例（禁单例）", ctx1.providers[0] is not ctx2.providers[0])
