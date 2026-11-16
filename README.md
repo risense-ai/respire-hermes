@@ -21,7 +21,7 @@ Respire (`rsrs`) is a local-first, encrypted memory system. This repository is i
 - **Status-aware prompt** — `system_prompt_block()` adds short usage rules and only surfaces engine/login/empty-library/model guidance when that state applies.
 - **Shared library** — one user-level `rsrs` library is shared across Hermes profiles and other agents on the machine by design.
 - **Fail-open** — every hook and tool catches errors, uses timeouts, and degrades to an empty injection rather than blocking the host turn.
-- **No Python dependencies** — the engine is a separately installed Node.js sidecar (`rsrs-cli@1.0.16`, with a native platform package from the same publisher). The plugin directory has no `pyproject.toml` or `python_dependencies`.
+- **No Python dependencies** — the engine is a separately installed Node.js sidecar (`rsrs-cli@1.0.20`, with a native platform package from the same publisher). The plugin directory has no `pyproject.toml` or `python_dependencies`.
 
 Compatibility: **Hermes Agent >= 0.22.5**, Linux and macOS (Apple Silicon; the rsrs CLI does not support Intel macOS). Hermes ships its own Python; the plugin itself is Python 3.9+ compatible.
 
@@ -29,11 +29,11 @@ Compatibility: **Hermes Agent >= 0.22.5**, Linux and macOS (Apple Silicon; the r
 
 1. Install and register the engine (official npm package; the agent may propose this command, but it must go through Hermes's normal approval flow):
    ```bash
-   npm i -g rsrs-cli@1.0.16
+   npm i -g rsrs-cli@1.0.20
    rsrs register --user <your-name>   # register at https://rsrs.rs; save the generated A3- recovery code
    rsrs model install && rsrs model activate m3   # optional semantic recall
    ```
-   The engine is external and is not bundled or downloaded by the plugin. `rsrs-cli@1.0.16` is published by the same vendor; npm verifies the tarball integrity (`npm view rsrs-cli@1.0.16 dist.integrity` → `sha512-jm4j338f1yfvd+QSv5Yy+1IlAxOjrvKmKAvVcsLihK0MGpqxSBql4EuaobTebYIK5VTVqo1CuR1DGmlpanrwFQ==`). Pin the version; do not use `@latest`.
+   The engine is external and is not bundled or downloaded by the plugin. `rsrs-cli@1.0.20` is published by the same vendor; npm verifies the tarball integrity (`npm view rsrs-cli@1.0.20 dist.integrity` → `sha512-z3oljsvbysDNmBI++rq+/K/Nn1ZeiaXlDgIX2Fzv06jBsTwUARg7ojra02/K7MhQaHI7SsLvj5etXP3QmhmbGQ==`). Pin the version; do not use `@latest`.
 2. Install the plugin. After this catalog entry is merged: `hermes plugins install respire`. From a source checkout: `bash scripts/install.sh`.
 3. Activate: `hermes memory setup` and choose `respire` (leave the engine path empty for auto-detection), or set `memory.provider: respire` and restart Hermes.
 4. Verify: `hermes respire status`.
@@ -71,7 +71,7 @@ Compatibility: **Hermes Agent >= 0.22.5**, Linux and macOS (Apple Silicon; the r
 
 ```bash
 # 1) 引擎（已装可跳过；装完 rsrs --version 验证）
-npm i -g rsrs-cli@1.0.16
+npm i -g rsrs-cli@1.0.20
 rsrs register --user <你的名字>   # 首设备注册，去 https://rsrs.rs；超级密码用系统生成的 A3- 恢复码并抄下
 # 语义召回（可选）：rsrs model install && rsrs model activate m3
 

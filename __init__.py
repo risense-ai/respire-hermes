@@ -26,7 +26,7 @@ import threading
 import time
 from pathlib import Path
 
-VERSION = "0.1.7"
+VERSION = "0.1.8"
 PROVIDER_NAME = "respire"
 
 logger = logging.getLogger("hermes.plugins.respire")
@@ -949,7 +949,7 @@ class RespireMemoryProvider(MemoryProvider):
             {
                 "key": "rsrs_path",
                 "description": ("rsrs binary path (empty: auto-detect PATH and common install locations). "
-                                "Install: npm i -g rsrs-cli@1.0.16"),
+                                "Install: npm i -g rsrs-cli@1.0.20"),
                 "default": "",
                 "env_var": "RESPIRE_BIN",
             },
