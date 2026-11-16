@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.8 — 2026-11-16
+
+- 引擎钉版同步：`rsrs-cli@1.0.16` → `rsrs-cli@1.0.20`（npm 稳定版），更新 README/plugin.yaml/cli.py/配置项提示中的安装指引与 integrity hash（`sha512-z3oljsv…mbGQ==`，取自 `npm view rsrs-cli@1.0.20 dist.integrity`）。
+- 验证：沙箱安装 `rsrs-cli@1.0.20` 原生 exe 作为 `RESPITE_RSRS` 引擎，`tests/test_provider.py` 194 断言全绿（含真库引擎段 recall/show/prefetch/is_available）、`tests/test_ci.py` 14 例 OK、`tests/test_release.py` 11 例 OK、`scripts/validate_plugin.py` all green（0.1.8）。真机 Hermes E2E 未跑（沿用 0.1.7 的 v0.22.5 基线记录；宿主 0.23.1 的 memory-provider 契约为可选增量，无破坏性变更）。
+- 版本 0.1.7 → 0.1.8（plugin.yaml 与 `__init__.py VERSION` 两处）。
+
 ## 0.1.7 — 2026-11-02
 
 - 注册真实 `pre_tool_call` 写前门，拒绝缺父节点、强写、清父节点参数及不可解析的可见 rsrs 写入；保留 CLI 默认 trivial、help 和正文中的字面字符。
