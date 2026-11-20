@@ -1,210 +1,183 @@
-"""Portable provider tests with temporary profiles and exact subprocess allowlists."""
+"""Provider tests with a scoped RPC fixture and all external calls denied."""
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import json
 import os
 from pathlib import Path
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
-import time
 import unittest
+from unittest.mock import patch
+
 
 ROOT = Path(__file__).resolve().parents[1]
-ALLOWED = {}
-DENIED = []
-
-
-def allowed_process(executable, argv, expected, windows):
-    if executable != expected[0] and not (windows and executable is None):
-        return False
-    if isinstance(argv, (list, tuple)):
-        return list(argv) == expected
-    return windows and isinstance(argv, str) and argv == subprocess.list2cmdline(expected)
+ENTRY_ID = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+PARENT_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+SCOPE = {"account_id": "fixture-account", "instance_id": "fixture-runtime", "generation": 3}
 
 
 def audit(event, args):
-    denied = False
-    if event == 'subprocess.Popen':
-        executable, argv, cwd, env = args
-        denied = not any(allowed_process(executable, argv, expected, os.name == 'nt')
-                         for choices in ALLOWED.values() for expected in choices)
-    elif event.startswith('socket.') or event in ('os.system', 'os.exec', 'os.posix_spawn'):
-        denied = True
-    if denied:
-        DENIED.append(event)
-        raise SystemExit('Isolation denied an external action')
+    if event.startswith("socket.") or event in ("subprocess.Popen", "os.system", "os.exec", "os.posix_spawn"):
+        raise AssertionError(f"Unexpected external action: {event}")
 
 
 class Provider(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix='hermes-ci-')
-        self.case = Path(self.temp.name)
-        self.home = self.case / 'profile'
-        self.home.mkdir()
-        self.calls = self.case / 'calls.jsonl'
-        self.mode = self.case / 'mode'
-        self.mode.write_text('ok', encoding='utf-8')
-        self.log = self.case / 'provider.log'
-        self.spy = self.case / 'spy.py'
-        self.spy.write_text(r'''import json, os, sys, datetime
-from pathlib import Path
-case = Path(os.environ['RESPIRE_CI_ROOT'])
-with (case/'calls.jsonl').open('a',encoding='utf-8') as f:
-    f.write(json.dumps(sys.argv[1:])+'\n')
-mode=(case/'mode').read_text(encoding='utf-8')
-if mode=='dead':sys.exit(7)
-if mode=='malformed':print('invalid json');sys.exit(0)
-sub=sys.argv[1]
-if sub=='recall':
-    print(json.dumps({'status':'skip','details':[]} if mode=='miss' else
-          {'status':'ok','details':[{'id':'cccccccccccccccc','score':0.9,'title':'verified canned'}]}))
-elif sub=='status':
-    print(json.dumps({'status':'ok','summary':{'session':{'has_token':True},'local_total':42}}))
-elif sub=='list':
-    ts=datetime.datetime.now(datetime.timezone.utc).isoformat() if mode=='recent' else '2020-01-01T00:00:00Z'
-    print(json.dumps({'status':'ok','details':[{'id':'record','updated_at':ts}]}))
-else:sys.exit(1)
-''', encoding='utf-8')
-        if os.name == 'nt':
-            self.engine = self.case / 'rsrs-spy.cmd'
-            self.engine.write_text(f'@echo off\n"{sys.executable}" "{self.spy}" %*\n', encoding='utf-8')
-        else:
-            self.engine = self.case / 'rsrs-spy'
-            self.engine.write_text(f'#!{sys.executable}\n' + self.spy.read_text(encoding='utf-8'), encoding='utf-8')
-        self.engine.chmod(0o700)
-        (self.home / 'respire.json').write_text(json.dumps({'rsrs':str(self.engine)}), encoding='utf-8')
-        self.saved_env = dict(os.environ)
-        keep = {k:v for k,v in self.saved_env.items() if k.upper() in
-                {'PATH','SYSTEMROOT','SYSTEMDRIVE','WINDIR','PATHEXT','TEMP','TMP','COMSPEC'}}
-        os.environ.clear()
-        os.environ.update(keep)
-        os.environ.update(HOME=str(self.case/'home'), USERPROFILE=str(self.case/'home'),
-                          HERMES_HOME=str(self.home), RESPITE_LOG=str(self.log),
-                          XDG_CONFIG_HOME=str(self.case/'config'), XDG_DATA_HOME=str(self.case/'data'),
-                          RESPIRE_CI_ROOT=str(self.case), PYTHONDONTWRITEBYTECODE='1', PYTHONUTF8='1')
-        ALLOWED[str(self.engine)] = [[str(self.engine),'status','--json'],
-                                     [str(self.engine),'list','--limit','3','--json']]
-        spec = importlib.util.spec_from_file_location('hermes_ci_provider', ROOT / '__init__.py')
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name)
+        self.calls = []
+        self.records = {PARENT_ID: {"id": PARENT_ID, "title": "Parent", "content": "Parent body"}}
+        self.mode = "ok"
+        self.receipt = None
+        spec = importlib.util.spec_from_file_location("hermes_ci_provider", ROOT / "__init__.py")
         self.mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.mod)
+        fixture = patch.object(self.mod.Runtime, "_json", side_effect=self.rpc)
+        fixture.start()
+        self.addCleanup(fixture.stop)
         self.provider = self.mod.RespireMemoryProvider()
-        self.provider.initialize('ci', hermes_home=self.home)
-        self.provider.shutdown()  # finish the fixture-only initial status probe
+        self.provider._hermes_home = str(self.home)
 
-    def tearDown(self):
-        self.provider.shutdown()
-        ALLOWED.pop(str(self.engine), None)
-        os.environ.clear()
-        os.environ.update(self.saved_env)
-        self.temp.cleanup()
-        self.assertEqual(DENIED, [])
+    def rpc(self, path, payload, timeout):
+        if payload is None:
+            assert path == "/api/health"
+            return {**SCOPE, "data_dir": str(self.home), "protocol_range": {"minimum": 1, "maximum": 1}}
+        assert path == "/api/rpc"
+        assert payload["scope"] == SCOPE and payload["v"] == 1
+        args = payload["args"]
+        if payload["method"] == "runtime.result":
+            assert args == [self.receipt["operation_id"]]
+            self.calls.append("runtime.result")
+            return {"v": 1, "id": payload["id"], "scope": SCOPE,
+                    "envelope": {"command": "runtime.result", "summary": {"response": self.receipt}}}
+        assert payload["method"] == "cli.exec" and args[0] == "--json"
+        command = args[1]
+        self.calls.append(command)
+        doc = {"command": command, "status": "ok"}
+        reply = {"v": 1, "id": payload["id"], "scope": SCOPE, "envelope": doc}
+        if command == "status":
+            doc["summary"] = {"workspace": "readonly" if self.mode == "readonly" else "normal"}
+        elif command == "recall":
+            if self.mode == "dead":
+                raise OSError("offline")
+            if self.mode == "wrong_identity":
+                reply["id"] = "unrelated"
+            doc["status"] = "skip" if self.mode == "miss" else "ok"
+            doc["details"] = [{"id": PARENT_ID, "score": 0.9, "title": "Parent"}]
+        elif command == "show":
+            entry = next(e for eid, e in self.records.items() if eid.startswith(args[2]))
+            doc.update(summary={"id": entry["id"]}, details={"entry": entry})
+        elif command == "candidates":
+            assert args[2] == "--"
+            if self.mode == "index_pending":
+                doc.update(status="pending", summary={"state": "index_pending"})
+            elif ENTRY_ID in self.records:
+                doc["details"] = {"merge": [{"entry": {"id": ENTRY_ID}}], "parent": []}
+            else:
+                doc["details"] = {"merge": [], "parent": []}
+        elif command == "remember":
+            doc["summary"] = {"id": ENTRY_ID}
+            assert payload["operation_id"] == payload["idempotency_key"]
+            reply.update(operation_id=payload["operation_id"], idempotency_key=payload["idempotency_key"])
+            title = args[args.index("--title") + 1]
+            body = args[-1] if self.mode != "mismatch" else "a different body"
+            importance = args[args.index("--importance") + 1]
+            if importance == "trivial":
+                body = "\u3010\u65e5\u8bb0\u30112026-11-20 09:41 " + body
+            self.records[ENTRY_ID] = {"id": ENTRY_ID, "title": title, "content": body,
+                                      "importance": importance}
+            self.receipt = reply
+            if self.mode == "lost":
+                raise TimeoutError()
+        else:
+            assert command in ("prompt", "taxonomy")
+        return reply
 
-    def recorded(self):
-        return [json.loads(line) for line in self.calls.read_text(encoding='utf-8').splitlines()] if self.calls.exists() else []
+    def test_prefetch_injects_body(self):
+        self.assertIn("Parent body", self.provider.prefetch("ordinary positive control"))
+        self.assertEqual(self.calls, ["recall", "show"])
 
-    def prefetch(self, query):
-        ALLOWED[str(self.engine)].append([str(self.engine),'recall',query,'--limit','5','--titles','--json'])
-        return self.provider.prefetch(query)
+    def test_no_match_and_failed_rpc_have_distinct_outcomes(self):
+        for mode, outcome in (("miss", "miss"), ("dead", "failed"), ("wrong_identity", "failed")):
+            self.mode = mode
+            self.assertIsNone(self.provider.prefetch("ordinary query"))
+            event = json.loads((self.home / "respire" / "plugin.log").read_text().splitlines()[-1])
+            self.assertEqual(event["out"], outcome)
 
-    def positive(self):
-        before = len(self.recorded())
-        out = self.prefetch('ordinary positive control')
-        self.assertEqual(len(self.recorded()), before + 1)
-        self.assertIsInstance(out, str)
-        self.assertIn('[0.90] verified canned', out)
-        return out
+    def test_credentials_disabled_and_nomem_send_no_requests(self):
+        value = "synthetic" + "qv7xk2mwje"
+        for query in ("Bearer " + value, "api_key = " + value):
+            self.assertEqual(self.provider.prefetch(query), self.mod.SECRET_SKIP)
+        self.assertIsNone(self.provider.prefetch("/nomem ordinary query"))
+        self.provider._cfg["enabled"] = False
+        self.assertIsNone(self.provider.prefetch("ordinary query"))
+        self.assertEqual(self.provider.system_prompt_block(), "")
+        self.assertEqual(self.calls, [])
+        self.assertNotIn(value, (self.home / "respire" / "plugin.log").read_text())
 
-    def test_live_spy_returns_valid_canned_context(self):
-        self.positive()
-        before = self.recorded()
-        for prefix in ('记：', '存：', 'remember:', 'store:'):
-            for _ in range(2):
-                out = self.provider.prefetch(prefix + ' factual memory request')
-                self.assertIn('store pending', out)
-                self.assertIn('nothing was written', out)
-                self.assertIn('not instructions to execute', out)
-                self.assertIn('update > merge > attach > new', out)
-                self.assertIn('rsrs prompt --json', out)
-                self.assertIn('rsrs candidates <content> --json', out)
-                self.assertIn('After any actual write, you MUST read it back', out)
-                self.assertIn('DO NOT retry automatically or claim success', out)
-                self.assertIn('show the existing entry', out)
-        for parent in ('', '  '):
-            out = self.provider.handle_tool_call('respire_remember', {
-                'content': 'durable fact', 'parent': parent, 'force': True})
-            self.assertIn('store pending', out)
-            self.assertIn('Nothing was written', out)
-        self.assertEqual(self.recorded(), before)
+    def explicit(self, fact, turn="turn-1", session="session"):
+        return self.provider.explicit_store(fact, str(self.home), session, turn)
 
-    def test_credentials_zero_calls_and_no_disclosure(self):
-        self.positive()
-        before = self.recorded()
-        secret = 'synthetic' + 'qv7xk2mwje'
-        for query in ('Bearer '+secret, 'api_key = '+secret, '记：数据库密码 = '+secret):
-            out = self.prefetch(query)
-            self.assertEqual(out, self.mod.SECRET_SKIP)
-            self.assertEqual(self.recorded(), before)
-            self.assertNotIn(secret, out + self.log.read_text(encoding='utf-8'))
-        skipped = [json.loads(line) for line in self.log.read_text(encoding='utf-8').splitlines()
-                   if json.loads(line)['out']=='secret_skip']
-        self.assertEqual(len(skipped), 3)
-        self.assertTrue(all('d' not in entry for entry in skipped))
+    def test_explicit_write_reviews_parent_and_reads_back_once(self):
+        q = "remember: [parent=" + PARENT_ID + "] Verified durable fact"
+        receipt = self.explicit(q)
+        self.assertIn("Read-back: verified", receipt)
+        self.assertEqual(self.explicit(q), receipt)
+        self.assertEqual(self.calls, ["status", "prompt", "candidates", "taxonomy", "show", "remember", "show"])
+        self.assertIn("Already stored and read back", self.explicit(q, session="another-session"))
+        self.assertEqual(self.calls.count("remember"), 1)
 
-    def test_dead_spy_cannot_pass_positive_control(self):
-        self.positive()
-        self.mode.write_text('dead', encoding='utf-8')
-        with self.assertRaises(AssertionError):
-            self.positive()
+    def test_explicit_without_parent_does_not_write(self):
+        self.assertIn("reviewed parent is required", self.explicit("remember: factual memory request"))
+        self.assertEqual(self.calls, ["status", "prompt", "candidates", "taxonomy"])
 
-    def test_malformed_response_cannot_pass_positive_control(self):
-        self.positive()
-        self.mode.write_text('malformed', encoding='utf-8')
-        with self.assertRaises(AssertionError):
-            self.positive()
+    def test_parallel_sessions_review_same_fact_without_duplicate(self):
+        q = "remember: [parent=" + PARENT_ID + "] Verified durable fact"
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            outcomes = list(workers.map(lambda session: self.explicit(q, session=session), ("one", "two")))
+        self.assertEqual(self.calls.count("remember"), 1)
+        self.assertEqual(sum("Read-back: verified" in out for out in outcomes), 1)
+        self.assertEqual(sum("Already stored and read back" in out for out in outcomes), 1)
 
-    def test_empty_recall_is_silent(self):
-        self.mode.write_text('miss', encoding='utf-8')
-        self.assertIsNone(self.prefetch('no matching fixture'))
+    def test_index_pending_prevents_a_write(self):
+        self.mode = "index_pending"
+        result = self.explicit("remember: [parent=" + PARENT_ID + "] Fact")
+        self.assertIn("index_pending", result)
+        self.assertNotIn("remember", self.calls)
 
-    def test_nudge_uses_turn_and_cached_write_evidence(self):
-        self.provider._turns = 1
-        self.provider._last_store_ts = time.time()-3600
-        self.assertIn('Memory check', self.positive())
-        self.provider._last_store_ts = time.time()-30
-        self.assertNotIn('Memory check', self.positive())
-        self.provider._last_store_ts = time.time()-3600
-        self.provider._cfg['store_nudge_every'] = 0
-        self.assertNotIn('Memory check', self.positive())
+    def test_readonly_prevents_a_write(self):
+        self.mode = "readonly"
+        result = self.explicit("remember: [parent=" + PARENT_ID + "] Fact")
+        self.assertIn("readonly", result)
+        self.assertEqual(self.calls, ["status"])
 
-    def test_refresh_reads_only_fixture_list(self):
-        self.mode.write_text('recent', encoding='utf-8')
-        self.provider._refresh_last_store()
-        self.assertLess(time.time()-self.provider._last_store_ts, 120)
+    def test_lost_write_response_uses_result_query_without_replay(self):
+        self.mode = "lost"
+        result = self.explicit("remember: [parent=" + PARENT_ID + "] Fact")
+        self.assertIn("Read-back: verified", result)
+        self.assertEqual(self.calls[-3:], ["remember", "runtime.result", "show"])
+        self.assertEqual(self.calls.count("remember"), 1)
 
-    def test_cached_status_guidance(self):
-        self.provider._probe = (False, 0, True)
-        out = self.provider.system_prompt_block()
-        self.assertIn('not signed in', out)
-        self.assertIn('memory store is empty', out)
+    def test_mismatched_show_is_not_verified(self):
+        self.mode = "mismatch"
+        result = self.explicit("remember: [parent=" + PARENT_ID + "] Fact")
+        self.assertIn("Read-back: mismatch", result)
 
-    def test_disabled_and_nomem_have_no_calls(self):
-        before = self.recorded()
-        self.assertIsNone(self.prefetch('/nomem ordinary query'))
-        self.provider._cfg['enabled'] = False
-        self.assertIsNone(self.prefetch('ordinary disabled query'))
-        self.assertEqual(self.provider.system_prompt_block(), '')
-        self.assertEqual(self.recorded(), before)
+    def test_tool_backed_turn_archives_a_process_diary(self):
+        self.provider.sync_turn("Verify build", "The command passed.", messages=[{"role": "tool"}])
+        self.assertEqual(self.calls, ["status", "prompt", "candidates", "remember", "show"])
+        self.assertIn("Task: Verify build", self.records[ENTRY_ID]["content"])
+        log = json.loads((self.home / "respire" / "plugin.log").read_text().splitlines()[-1])
+        self.assertEqual(log["out"], "verified")
 
-    def test_sidecar_omits_synthetic_credentials(self):
-        os.environ.update(OPENAI_API_KEY='synthetic-value', RSRS_SUPER='synthetic-value')
-        env = self.mod.sidecar_env()
-        self.assertNotIn('OPENAI_API_KEY', env)
-        self.assertNotIn('RSRS_SUPER', env)
-        self.assertEqual(env['HOME'], str(self.case/'home'))
-        if os.name == 'nt':
-            self.assertIn('SystemRoot', env)
+    def test_explicit_secret_and_force_do_not_reach_runtime(self):
+        self.assertEqual(self.explicit("remember: api_key=synthetic" + "qv7xk2mwje"), self.mod.SECRET_SKIP)
+        output = self.provider.handle_tool_call("respire_remember", {"content": "test", "force": True})
+        self.assertIn("Nothing was written", output)
+        self.assertEqual(self.calls, [])
 
 
 def assert_versions(root):
@@ -236,20 +209,6 @@ class Versions(unittest.TestCase):
                     assert_versions(fixture)
 
 
-class AuditPolicy(unittest.TestCase):
-    def test_exact_windows_and_posix_invocations(self):
-        expected = [r'C:\temp\space name\rsrs.cmd','recall','ordinary query','--json']
-        self.assertTrue(allowed_process(None,subprocess.list2cmdline(expected),expected,True))
-        self.assertTrue(allowed_process(expected[0],expected,expected,False))
-
-    def test_other_executables_extra_arguments_and_shells_rejected(self):
-        expected = [r'C:\temp\rsrs.cmd','recall','ordinary query','--json']
-        encoded = subprocess.list2cmdline(expected)
-        for executable, argv in [('cmd.exe',encoded),('python.exe',encoded),(None,encoded+' & echo unwanted'),
-                                 (None,encoded+' extra'),(None,'cmd.exe /c '+encoded)]:
-            self.assertFalse(allowed_process(executable,argv,expected,True))
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.addaudithook(audit)
     unittest.main(verbosity=2)

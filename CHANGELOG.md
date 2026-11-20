@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.9
+
+- Use scoped loopback Runtime RPC for memory operations. Start Runtime with the host CLI service.
+- Recall bodies before inference; handle explicit storage before model execution with candidate review and read-back.
+- Review completed tool-backed turns for process diaries and log the outcome.
+
 ## 0.1.8 — 2026-11-16
 
 - 引擎钉版同步：`rsrs-cli@1.0.16` → `rsrs-cli@1.0.20`（npm 稳定版），更新 README/plugin.yaml/cli.py/配置项提示中的安装指引与 integrity hash（`sha512-z3oljsv…mbGQ==`，取自 `npm view rsrs-cli@1.0.20 dist.integrity`）。

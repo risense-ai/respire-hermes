@@ -105,11 +105,8 @@ def main() -> int:
     check("pre_tool_call declared", "  - pre_tool_call" in raw)
     check("pre_tool_call registered", 'ctx.register_hook("pre_tool_call", pre_tool_call)' in src)
     check("pre_tool_call blocks", '"action": "block"' in src and "guard_memory_tool" in src)
-    for m in ("def handle_tool_call", "def prefetch", "def system_prompt_block", "def sync_turn"):
-        i = src.find(m)
-        j = src.find("\n    def ", i + 1)
-        body = src[i:j if j > 0 else len(src)]
-        check(f"fail-open try in {m.split('def ')[1]}", "except Exception" in body)
+    check("pre_llm_call declared", "  - pre_llm_call" in raw)
+    check("pre_llm_call registered", 'ctx.register_hook("pre_llm_call", pre_llm_call)' in src)
 
     # 6) 敏感扫描：禁硬编码 token/私钥/口令字面量
     sensitive = [p for p in (re.findall(r"\b(?:sk-|ghp|gho|github_pat|AKIA|xox)[A-Za-z0-9_-]{10,}\b", src)

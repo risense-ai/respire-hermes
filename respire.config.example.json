@@ -7,6 +7,5 @@
   "budget_chars": 1500,
   "enabled": true,
   "auto_recall": true,
-  "store_nudge_every": 1,
   "skip_prefixes": []
 }
