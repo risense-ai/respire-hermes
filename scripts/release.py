@@ -114,7 +114,7 @@ The ZIP contains only committed files from this exact tag/commit; its comment re
 
 Install: extract the plugin root to the Hermes plugin directory and follow README's memory-provider setup instructions. The rsrs engine is installed separately with `npm i -g rsrs-cli@latest`.
 
-Verification: CI runs package validation and isolated credential-guard tests with temporary stub engines, including a required normal-input positive control and a dead-stub negative control. No real rsrs engine, user database or host installation is used. CI tests the workflow revision; recovery packages an existing tag without executing that tag's code.
+Verification: CI runs package validation, scoped RPC fixtures, and isolated credential-guard tests. CI tests the workflow revision. Recovery packages the exact existing tag.
 
 The original merged source received independent Linux verification of 96 extracted stub assertions and four additional same-spy guard scenarios. That audit found plugin.yaml 0.1.1 versus provider VERSION 0.1.0, subsequently aligned by the contributor in e982040; automated checks require agreement before publication. CI enforces equality without changing application code. The original full real-engine suite, real Hermes contextvars/host concurrency and Windows installed-host integration remain independently unverified. Credential detection remains heuristic.
 

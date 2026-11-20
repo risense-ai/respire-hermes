@@ -23,10 +23,12 @@ def _provider():
 
 def cmd_status(args):
     try:
-        prov, _ = _provider()
-        prov.initialize("cli-status", hermes_home=_hermes_home())
+        prov, mod = _provider()
+        prov._hermes_home = _hermes_home()
+        prov._cfg = prov._load_config()
+        prov._probe = mod.probe_status(mod.Runtime())
         st = prov.get_status_config()
-        print(f"engine: {st['engine'] or '(not found — npm i -g rsrs-cli@1.0.20)'}")
+        print(f"engine: {st['engine'] or '(host CLI not found)'}")
         print(f"logged_in: {st['logged_in']}")
         print(f"entries: {st['entries']}")
         print(f"probe_ok: {st['probe_ok']}")
@@ -56,9 +58,8 @@ def cmd_recall(args):
 
 
 def cmd_install_engine(args):
-    print("Engine install: npm i -g rsrs-cli@1.0.20")
-    print("Then: rsrs --version   (register at https://rsrs.rs, then `rsrs register --user <name>` on this machine)")
-    print("Optional semantic model: rsrs model install && rsrs model activate m3")
+    print("Install a compatible Respire CLI and Runtime from https://docs.rsrs.rs/runtime.")
+    print("Start the Runtime with the configured host service or rsrs runtime start.")
 
 
 def register_cli(subparser) -> None:

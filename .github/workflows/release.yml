@@ -37,6 +37,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: python scripts/validate_plugin.py
+      - run: python tests/test_provider.py
       - run: python tests/test_ci.py
       - run: python -m unittest discover -s tests -p test_release.py -v
         if: ${{ always() && !cancelled() }}
