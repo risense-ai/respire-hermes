@@ -50,7 +50,10 @@ except Exception:  # pragma: no cover
 # 超时窗（秒）：须盖住 rsrs runtime 冷启动（实测 doctor 模型加载 7s+），否则首轮静默、热后即灵
 RECALL_T = 14
 PROBE_T = 10
-STORE_T = 18
+STORE_T = 120
+# 候选审查（candidates/taxonomy）要跑 embedding 并扫全库：CPU-only 机器实测稳定 17s
+# （5372 条条目、BGE/m3 模型），默认 8s 会把每次写入判成 "Runtime write review failed"。
+REVIEW_T = 90
 LOG_MAX = 256 * 1024  # plugin.log 超此整文件清轮
 
 
@@ -603,7 +606,7 @@ def do_store(rpc, content, title="", importance="important", parent=None, force=
 
     try:
         rpc.bind(PROBE_T)
-        status = rpc.call("status")
+        status = rpc.call("status", timeout=PROBE_T)
         if status.get("status") != "ok":
             return "Nothing was written. Runtime status is unavailable."
         mode = status["summary"]["workspace"]
@@ -611,7 +614,7 @@ def do_store(rpc, content, title="", importance="important", parent=None, force=
             return "Nothing was written. Runtime workspace mode is unknown."
         if mode != "normal":
             return f"Nothing was written. The memory workspace is {mode}."
-        policy = rpc.call("prompt")
+        policy = rpc.call("prompt", timeout=REVIEW_T)
         if policy.get("status") != "ok":
             return "Nothing was written. Runtime did not provide its memory rules."
         if not rpc.data_dir:
@@ -623,7 +626,7 @@ def do_store(rpc, content, title="", importance="important", parent=None, force=
             config = {}
         if not isinstance(config, dict):
             return "Nothing was written. Respire agent configuration is invalid."
-        review = rpc.call("candidates", "--", content)
+        review = rpc.call("candidates", "--", content, timeout=REVIEW_T)
         if review.get("status") != "ok":
             state = review.get("summary", {}).get("state") or review.get("status")
             return f"Nothing was written. Candidate review: {state}."
@@ -637,7 +640,7 @@ def do_store(rpc, content, title="", importance="important", parent=None, force=
         if candidates["merge"]:
             return "Nothing was written. Similar entries need an update or merge decision."
         if importance == "important":
-            if rpc.call("taxonomy", "--list").get("status") != "ok":
+            if rpc.call("taxonomy", "--list", timeout=REVIEW_T).get("status") != "ok":
                 return "Nothing was written. Taxonomy review failed."
             if not parent:
                 return ("Nothing was written. A reviewed parent is required for important memory. "
