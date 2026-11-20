@@ -100,6 +100,32 @@ class Provider(unittest.TestCase):
         self.assertIn("Parent body", self.provider.prefetch("ordinary positive control"))
         self.assertEqual(self.calls, ["recall", "show"])
 
+    def test_prefetch_status_counts_without_memory_content(self):
+        with patch.object(self.mod, "publish_status") as publish:
+            self.assertIn("Parent body", self.provider.prefetch("ordinary positive control", session_id="private"))
+            publish.assert_called_once_with("private", "🧠 Respire · Recalled 1 · Read 1 bodies")
+            self.provider._cfg["show_status"] = False
+            self.provider.prefetch("ordinary positive control", session_id="private")
+            self.assertEqual(publish.call_count, 1)
+
+    def test_notice_scope_and_save_receipt(self):
+        from types import SimpleNamespace
+
+        source = dict(chat_type="dm", is_bot=False, shared_session=False, parent_chat_id=None,
+                      thread_id=None, delivered_via_upstream_relay=False, detached_route=None)
+        self.assertTrue(self.mod._private_status_source(SimpleNamespace(**source)))
+        for name, value in (("chat_type", "group"), ("thread_id", "thread"), ("shared_session", True)):
+            self.assertFalse(self.mod._private_status_source(SimpleNamespace(**(source | {name: value}))))
+        self.assertEqual(
+            self.mod.store_status("Saved Title (cccccccc). Read-back: verified. Runtime result: ok."),
+            "Saved 1 · Read-back verified",
+        )
+        self.assertEqual(
+            self.mod.store_status("Saved Title (cccccccc). Read-back: unavailable. Runtime result: ok."),
+            "Write acknowledged · Read-back unconfirmed",
+        )
+        self.assertEqual(self.mod.store_status("Write result unknown."), "Save outcome unknown")
+
     def test_no_match_and_failed_rpc_have_distinct_outcomes(self):
         for mode, outcome in (("miss", "miss"), ("dead", "failed"), ("wrong_identity", "failed")):
             self.mode = mode

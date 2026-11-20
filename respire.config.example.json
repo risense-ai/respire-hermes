@@ -7,5 +7,6 @@
   "budget_chars": 1500,
   "enabled": true,
   "auto_recall": true,
+  "show_status": true,
   "skip_prefixes": []
 }

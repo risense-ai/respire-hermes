@@ -1,5 +1,5 @@
 name: respire
-version: 0.1.9
+version: 0.1.10
 description: "Encrypted Respire memory through local Runtime RPC. Hermes hooks drive recall, reviewed storage, and process diaries."
 requires_hermes: ">=0.23.2"
 platforms:
