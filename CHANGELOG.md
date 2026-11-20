@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.10
+
+- Show Respire recall counts, body reads and save verification as private gateway notices. Group chats and group threads do not receive the notices.
+
 ## 0.1.9
 
 - Use scoped loopback Runtime RPC for memory operations. Start Runtime with the host CLI service.

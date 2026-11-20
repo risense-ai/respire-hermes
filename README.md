@@ -22,6 +22,8 @@ Each RPC uses the Runtime's account, instance, and generation. A write carries a
 
 ## Configuration and logs
 
+With `show_status` enabled by default, supported Hermes gateways show a short Respire notice in the local session viewer and in direct Fluxer or WeChat chats. Recall reports distinct matching entries and the number of bodies read for the turn. An explicit body read has its own notice. A background save reports whether its read-back was verified. These counts describe operations, not whether the model relied on a memory in its answer. Notices include no titles, text, queries, or entry IDs. Set `"show_status": false` to hide them.
+
 Copy `respire.config.example.json` to `$HERMES_HOME/respire.json` to override defaults. `enabled` controls plugin memory operations, `auto_recall` controls prefetch, and `skip_prefixes` excludes internal prompts. `recall_limit`, `recall_threshold`, and `budget_chars` control the injected context. `rsrs` is an optional host CLI path displayed by setup and status.
 
 With `log` enabled, the plugin logs outcomes to `$HERMES_HOME/respire/plugin.log` or `RESPITE_LOG`. A prefetch hit means Hermes received recalled context. A verified write means ID, title, and full body matched the read-back. Logs omit prompts and memory bodies.
