@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
-VERSION = "0.1.10"
+VERSION = "0.1.11"
 PROVIDER_NAME = "respire"
 
 logger = logging.getLogger("hermes.plugins.respire")
@@ -50,10 +50,9 @@ except Exception:  # pragma: no cover
 # 超时窗（秒）：须盖住 rsrs runtime 冷启动（实测 doctor 模型加载 7s+），否则首轮静默、热后即灵
 RECALL_T = 14
 PROBE_T = 10
-STORE_T = 120
-# 候选审查（candidates/taxonomy）要跑 embedding 并扫全库：CPU-only 机器实测稳定 17s
-# （5372 条条目、BGE/m3 模型），默认 8s 会把每次写入判成 "Runtime write review failed"。
-REVIEW_T = 90
+STORE_T = 18
+# Candidate review embeds the query and can exceed the regular RPC timeout on CPU.
+CANDIDATES_T = 90
 LOG_MAX = 256 * 1024  # plugin.log 超此整文件清轮
 
 
@@ -140,12 +139,17 @@ class RuntimeErrorResponse(Exception):
 
 
 class Runtime:
-    def __init__(self):
+    def __init__(self, deadline=None):
         self.port = int(os.environ.get("RSRS_RPC_PORT") or 15169)
         self.scope = None
         self.data_dir = None
+        self.deadline = deadline
 
     def _json(self, path, payload, timeout):
+        if self.deadline is not None:
+            timeout = min(timeout, self.deadline - time.monotonic())
+            if timeout <= 0:
+                raise TimeoutError("Hermes save hook deadline expired")
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
         try:
             if payload is None:
@@ -452,6 +456,34 @@ def write_parent_error(args, check_parent, check_update=None):
     return None
 
 
+_CAT_HEREDOC = re.compile(r"""(<<-?)[ \t]*(?P<quote>['"])(?P<delimiter>[A-Za-z0-9_]+)(?P=quote)""")
+_CAT_OUTPUT = r">>?[ \t]*[A-Za-z0-9_./-]+"
+_CAT_HEADER = re.compile(
+    rf"[ \t]*cat(?=[ \t<])(?:[ \t]*(?:{_CAT_HEREDOC.pattern}|{_CAT_OUTPUT}))+[ \t]*"
+)
+
+
+def _without_literal_cat_heredocs(command):
+    """Exclude literal input to a standalone cat before scanning executable text."""
+    # shortcut: only leading cat with simple redirections, expand with a shell parser if needed.
+    header, newline, body = command.partition("\n")
+    if not newline or not _CAT_HEADER.fullmatch(header):
+        return command
+    end = 0
+    for op, _, delimiter in _CAT_HEREDOC.findall(header):
+        while end < len(body):
+            next_end = body.find("\n", end)
+            line = body[end:] if next_end == -1 else body[end:next_end]
+            end = len(body) if next_end == -1 else next_end + 1
+            if op == "<<-":
+                line = line.lstrip("\t")
+            if line == delimiter:
+                break
+        else:
+            return command
+    return header + newline + body[end:]
+
+
 def guard_memory_tool(tool_name, args, check_parent, check_update=None, provider_tool=False, _wrapped=False):
     """Guard visible rsrs CLI/native calls without running the requested write."""
     # shortcut: scripts and aliases are opaque here; Core must guard those write paths.
@@ -477,6 +509,8 @@ def guard_memory_tool(tool_name, args, check_parent, check_update=None, provider
     command = args.get("command") if isinstance(args, dict) else None
     if not isinstance(command, str):
         return None
+    if name.lower() != "powershell":
+        command = _without_literal_cat_heredocs(command)
     # Keep operator provenance: a quoted ">" or "%" is memory content, not shell syntax.
     pattern = r"""(?:'[^']*'|"(?:\\.|[^"\\])*"|\\[^\r\n]|[^\s;&|<>()'"\\])+|[;&|<>()]+|[\r\n]+"""
     parts, cursor, malformed = [], 0, False
@@ -606,7 +640,7 @@ def do_store(rpc, content, title="", importance="important", parent=None, force=
 
     try:
         rpc.bind(PROBE_T)
-        status = rpc.call("status", timeout=PROBE_T)
+        status = rpc.call("status")
         if status.get("status") != "ok":
             return "Nothing was written. Runtime status is unavailable."
         mode = status["summary"]["workspace"]
@@ -614,7 +648,7 @@ def do_store(rpc, content, title="", importance="important", parent=None, force=
             return "Nothing was written. Runtime workspace mode is unknown."
         if mode != "normal":
             return f"Nothing was written. The memory workspace is {mode}."
-        policy = rpc.call("prompt", timeout=REVIEW_T)
+        policy = rpc.call("prompt")
         if policy.get("status") != "ok":
             return "Nothing was written. Runtime did not provide its memory rules."
         if not rpc.data_dir:
@@ -626,7 +660,7 @@ def do_store(rpc, content, title="", importance="important", parent=None, force=
             config = {}
         if not isinstance(config, dict):
             return "Nothing was written. Respire agent configuration is invalid."
-        review = rpc.call("candidates", "--", content, timeout=REVIEW_T)
+        review = rpc.call("candidates", "--", content, timeout=CANDIDATES_T)
         if review.get("status") != "ok":
             state = review.get("summary", {}).get("state") or review.get("status")
             return f"Nothing was written. Candidate review: {state}."
@@ -640,7 +674,7 @@ def do_store(rpc, content, title="", importance="important", parent=None, force=
         if candidates["merge"]:
             return "Nothing was written. Similar entries need an update or merge decision."
         if importance == "important":
-            if rpc.call("taxonomy", "--list", timeout=REVIEW_T).get("status") != "ok":
+            if rpc.call("taxonomy", "--list").get("status") != "ok":
                 return "Nothing was written. Taxonomy review failed."
             if not parent:
                 return ("Nothing was written. A reviewed parent is required for important memory. "
@@ -930,7 +964,7 @@ class RespireMemoryProvider(MemoryProvider):
         self._status(session_id, f"Recalled {counts[0]} · Read {counts[1]} bodies")
         return text or None
 
-    def explicit_store(self, query, profile, session_id, turn_id):
+    def explicit_store(self, query, profile, session_id, turn_id, *, deadline=None):
         q = query.strip()
         match = STORE_PREFIX.match(q)
         if not match:
@@ -943,13 +977,18 @@ class RespireMemoryProvider(MemoryProvider):
         if parent_match:
             content = content[parent_match.end():].strip()
         key = (profile, session_id)
-        with self._lock:
+        lock_timeout = -1 if deadline is None else max(0, deadline - time.monotonic())
+        if not self._lock.acquire(timeout=lock_timeout):
+            return "Nothing was written. Another save is still being reviewed."
+        try:
             cached = self._explicit_turns.get(key)
             if cached and cached[0] == turn_id:
                 return cached[1]
-            receipt = do_store(Runtime(), content, parent=parent)
+            receipt = do_store(Runtime(deadline), content, parent=parent)
             self._explicit_turns[key] = (turn_id, receipt)
-        return receipt
+            return receipt
+        finally:
+            self._lock.release()
 
     def queue_prefetch(self, query, *, session_id: str = ""):
         """每轮结束后预热下一轮。rsrs runtime 常驻、recall 热态亚秒——无需预热，留空。"""
@@ -1140,12 +1179,14 @@ def register(ctx) -> None:
     ctx.register_hook("pre_tool_call", pre_tool_call)
 
     def pre_llm_call(user_message="", session_id="", turn_id="", parent_session_id=None, **kwargs):
+        started = time.monotonic()
         if parent_session_id or not isinstance(user_message, str) or not turn_id:
             return None
         if not STORE_PREFIX.match(user_message.strip()):
             return None
         from agent.memory_manager import _redact_for_provider
         from hermes_cli.config import load_config
+        from hermes_cli.plugins import _resolve_hook_callback_timeout
         from hermes_constants import get_hermes_home
         if load_config().get("memory", {}).get("provider") != PROVIDER_NAME:
             return None
@@ -1156,8 +1197,11 @@ def register(ctx) -> None:
         config = provider._load_config(profile)
         if not config["enabled"]:
             return None
+        timeout = _resolve_hook_callback_timeout()
+        # Return a receipt before Hermes abandons the hook thread.
+        deadline = started + max(0, timeout - 1) if timeout > 0 else None
         try:
-            receipt = provider.explicit_store(clean, profile, session_id, turn_id)
+            receipt = provider.explicit_store(clean, profile, session_id, turn_id, deadline=deadline)
         except (ValueError, OSError) as exc:
             logger.warning("Respire explicit storage failed: %s", type(exc).__name__)
             receipt = "Nothing was written. Check the Respire Runtime configuration."

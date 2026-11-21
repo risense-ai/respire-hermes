@@ -34,6 +34,18 @@ mod.register(ctx2)
 check("pre_tool_call registered", callable(ctx1.hooks.get("pre_tool_call")))
 check("terminal missing parent blocked", ctx1.hooks["pre_tool_call"](tool_name="terminal", args={"command": "rsrs remember fact --importance important"})["action"] == "block")
 check("unrelated terminal unaffected", ctx1.hooks["pre_tool_call"](tool_name="terminal", args={"command": "echo hello"}) is None)
+literal_note = "Example: " + chr(96) + "rsrs --json remember --title demo --parent 0123abcd -- body" + chr(96)
+heredoc = "cat > /tmp/notes.md <<'EOF'\n" + literal_note + "\nrsrs remember example\nEOF\n"
+for command in (heredoc, 'cat <<-"END"\n\t' + literal_note + '\n\tEND',
+                "cat <<'FIRST' <<'SECOND'\n" + literal_note + "\nFIRST\n" + literal_note + "\nSECOND\n"):
+    check("quoted cat heredoc is literal", ctx1.hooks["pre_tool_call"](
+        tool_name="terminal", args={"command": command}) is None)
+for command in (heredoc + "rsrs remember example --importance important",
+                heredoc.replace("<<'EOF'", "<<EOF"),
+                heredoc.removesuffix("EOF\n"),
+                heredoc.replace("cat", "bash", 1)):
+    check("executable or unrecognized input still checked", ctx1.hooks["pre_tool_call"](
+        tool_name="terminal", args={"command": command})["action"] == "block")
 for command in ["rsrs remember 'body --parent aaaabbbb' --importance important", "rsrs remember fact --parent ''",
                 "rsrs remember fact --parent aaaabbbb --force", "rsrs update deadbeef --clear-parent",
                 "rsrs remember fact --parent none", "echo ok; rsrs remember fact",
