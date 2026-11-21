@@ -35,6 +35,7 @@ class Provider(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("hermes_ci_provider", ROOT / "__init__.py")
         self.mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.mod)
+        self.original_json = self.mod.Runtime._json
         fixture = patch.object(self.mod.Runtime, "_json", side_effect=self.rpc)
         fixture.start()
         self.addCleanup(fixture.stop)
@@ -72,6 +73,7 @@ class Provider(unittest.TestCase):
             doc.update(summary={"id": entry["id"]}, details={"entry": entry})
         elif command == "candidates":
             assert args[2] == "--"
+            assert timeout == 90
             if self.mode == "index_pending":
                 doc.update(status="pending", summary={"state": "index_pending"})
             elif ENTRY_ID in self.records:
@@ -173,6 +175,12 @@ class Provider(unittest.TestCase):
         result = self.explicit("remember: [parent=" + PARENT_ID + "] Fact")
         self.assertIn("index_pending", result)
         self.assertNotIn("remember", self.calls)
+
+    def test_expired_hook_deadline_does_not_open_a_connection(self):
+        with patch.object(self.mod.Runtime, "_json", self.original_json):
+            runtime = self.mod.Runtime(deadline=0)
+            with self.assertRaises(TimeoutError):
+                runtime.bind(5)
 
     def test_readonly_prevents_a_write(self):
         self.mode = "readonly"

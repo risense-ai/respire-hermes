@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.11
+
+- Preserve literal Markdown and command examples in quoted heredocs passed to `cat` (issue #12).
+- Allow up to 90 seconds for candidate review on CPU hosts (from PR #11 by ShiningRay).
+
 ## 0.1.10
 
 - Show Respire recall counts, body reads and save verification as private gateway notices. Group chats and group threads do not receive the notices.
